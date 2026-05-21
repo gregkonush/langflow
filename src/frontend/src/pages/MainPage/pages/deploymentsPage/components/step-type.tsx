@@ -1,5 +1,6 @@
 import { ChevronDown } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import ForwardedIconComponent from "@/components/common/genericIconComponent";
 import { Input } from "@/components/ui/input";
 import {
@@ -11,7 +12,6 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { useGetDeploymentLlms } from "@/controllers/API/queries/deployments/use-get-deployment-llms";
-import { useTranslation } from "react-i18next";
 import { cn } from "@/utils/utils";
 import { useDeploymentStepper } from "../contexts/deployment-stepper-context";
 import { useErrorAlert } from "../hooks/use-error-alert";
@@ -145,7 +145,7 @@ export default function StepType() {
 
       <div className="flex flex-col">
         <span className="pb-2 text-sm font-medium">
-          Display Name <span className="text-destructive">*</span>
+          Name <span className="text-destructive">*</span>
         </span>
         <Input
           placeholder={t("deployments.placeholderSalesBot")}
@@ -160,7 +160,7 @@ export default function StepType() {
         />
         {hasDeploymentNameFormatError && (
           <span className="mt-1 text-xs text-destructive">
-            Display name is required.
+            Name is required.
           </span>
         )}
       </div>
