@@ -923,10 +923,12 @@ class TestUpdateSnapshotRoute:
     @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
     @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
     @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.validate_project_scoped_flow_version_ids", new_callable=AsyncMock)
     @patch(f"{ROUTES_MODULE}.get_attachment_by_provider_snapshot_id", new_callable=AsyncMock)
     async def test_updates_all_attachment_rows_for_snapshot(
         self,
         mock_get_attachment,
+        mock_validate_fv,
         mock_get_pa,
         mock_get_mapper,
         mock_resolve_adapter,
@@ -980,6 +982,12 @@ class TestUpdateSnapshotRoute:
             user_id=user.id,
             provider_snapshot_id="tool-1",
         )
+        mock_validate_fv.assert_awaited_once_with(
+            flow_version_ids=[target_flow_version_id],
+            user_id=user.id,
+            project_id=deployment.project_id,
+            db=session,
+        )
         mock_update_rows.assert_awaited_once_with(
             session,
             user_id=user.id,
@@ -996,10 +1004,12 @@ class TestUpdateSnapshotRoute:
     @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
     @patch(f"{ROUTES_MODULE}.get_deployment_mapper")
     @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.validate_project_scoped_flow_version_ids", new_callable=AsyncMock)
     @patch(f"{ROUTES_MODULE}.get_attachment_by_provider_snapshot_id", new_callable=AsyncMock)
     async def test_commit_failure_attempts_provider_compensation(
         self,
         mock_get_attachment,
+        mock_validate_fv,
         mock_get_pa,
         mock_get_mapper,
         mock_resolve_adapter,
@@ -1054,7 +1064,65 @@ class TestUpdateSnapshotRoute:
 
         session.commit.assert_awaited_once()
         session.rollback.assert_awaited_once()
+        mock_validate_fv.assert_awaited_once_with(
+            flow_version_ids=[target_flow_version_id],
+            user_id=user.id,
+            project_id=deployment.project_id,
+            db=session,
+        )
         assert adapter.update_snapshot.await_count == 2
+
+    @pytest.mark.asyncio
+    @patch("langflow.services.database.models.flow_version.crud.get_flow_version_entry", new_callable=AsyncMock)
+    @patch("langflow.services.database.models.deployment.crud.get_deployment", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.resolve_deployment_adapter")
+    @patch(f"{ROUTES_MODULE}.get_owned_provider_account_or_404", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.validate_project_scoped_flow_version_ids", new_callable=AsyncMock)
+    @patch(f"{ROUTES_MODULE}.get_attachment_by_provider_snapshot_id", new_callable=AsyncMock)
+    async def test_project_scope_validation_runs_before_provider_update(
+        self,
+        mock_get_attachment,
+        mock_validate_fv,
+        mock_get_pa,
+        mock_resolve_adapter,
+        mock_get_deployment_row,
+        mock_get_flow_version,
+    ):
+        from langflow.api.v1.deployments import update_snapshot
+
+        user = _fake_user()
+        target_flow_version_id = uuid4()
+        attachment = SimpleNamespace(
+            flow_version_id=uuid4(),
+            deployment_id=uuid4(),
+            provider_snapshot_id="tool-1",
+        )
+        deployment = _fake_deployment_row(id=attachment.deployment_id)
+        mock_get_attachment.return_value = attachment
+        mock_get_deployment_row.return_value = deployment
+        mock_get_flow_version.return_value = SimpleNamespace(id=target_flow_version_id, flow_id=uuid4(), data={})
+        mock_validate_fv.side_effect = HTTPException(status_code=404, detail="out of project")
+
+        session = AsyncMock()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await update_snapshot(
+                provider_snapshot_id="tool-1",
+                body=SnapshotUpdateRequest(flow_version_id=target_flow_version_id),
+                session=session,
+                current_user=user,
+                telemetry=_fake_telemetry(),
+            )
+
+        assert exc_info.value.status_code == 404
+        mock_validate_fv.assert_awaited_once_with(
+            flow_version_ids=[target_flow_version_id],
+            user_id=user.id,
+            project_id=deployment.project_id,
+            db=session,
+        )
+        mock_get_pa.assert_not_awaited()
+        mock_resolve_adapter.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
