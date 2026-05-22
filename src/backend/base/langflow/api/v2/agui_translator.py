@@ -11,6 +11,8 @@ list. The translator is stateful: one instance per run.
 
 from __future__ import annotations
 
+import json
+
 from ag_ui.core import (
     BaseEvent,
     RunErrorEvent,
@@ -23,6 +25,10 @@ from ag_ui.core import (
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
+    ToolCallArgsEvent,
+    ToolCallEndEvent,
+    ToolCallResultEvent,
+    ToolCallStartEvent,
 )
 
 
@@ -39,6 +45,13 @@ class AGUITranslator:
         # Id of the text message currently being streamed by ``token`` events,
         # or ``None`` when no message is open.
         self._open_message_id: str | None = None
+        # Message ids already emitted as a complete (non-streamed) text message.
+        self._emitted_text_message_ids: set[str] = set()
+        # Tool-call ids already emitted as TOOL_CALL_START / already resolved
+        # with a TOOL_CALL_RESULT. ``add_message`` can re-fire with the same
+        # (append-only) content_blocks, so emissions must be deduplicated.
+        self._started_tool_calls: set[str] = set()
+        self._resulted_tool_calls: set[str] = set()
 
     def start(self) -> list[BaseEvent]:
         """Open the run.
@@ -62,6 +75,8 @@ class AGUITranslator:
             return self._translate_build_start(data)
         if event_type == "end_vertex":
             return self._translate_end_vertex(data)
+        if event_type == "add_message":
+            return self._translate_add_message(data)
 
         # Only terminal events close an open text message. Non-terminal events
         # (build_start, end_vertex, log, ...) interleave with tokens of the same
@@ -133,6 +148,79 @@ class AGUITranslator:
             StepFinishedEvent(step_name=node_id),
             StateDeltaEvent(delta=[self._set_node(node_id, status, build_data.get("data"))]),
         ]
+
+    def _translate_add_message(self, data: dict) -> list[BaseEvent]:
+        """Map an ``add_message`` to text-message and tool-call events.
+
+        ``add_message`` can fire repeatedly for one message as its content grows;
+        emissions are deduplicated by message id and tool-call id.
+        """
+        message_id = str(data.get("id") or "")
+        events: list[BaseEvent] = []
+
+        # Tool-use content blocks become tool-call lifecycle events.
+        for block_index, block in enumerate(data.get("content_blocks") or []):
+            if not isinstance(block, dict):
+                continue
+            for content_index, content in enumerate(block.get("contents") or []):
+                if isinstance(content, dict) and content.get("type") == "tool_use":
+                    events.extend(self._translate_tool_use(message_id, block_index, content_index, content))
+
+        # Message text.
+        if message_id and message_id == self._open_message_id:
+            # Finalizer of a token-streamed message: close it. The text was
+            # already streamed token by token, so it must not be re-emitted now
+            # or by any later add_message that re-fires for the same id.
+            self._emitted_text_message_ids.add(message_id)
+            events.extend(self._close_open_message())
+        else:
+            text = data.get("text") or ""
+            if text and message_id not in self._emitted_text_message_ids:
+                self._emitted_text_message_ids.add(message_id)
+                events.append(TextMessageStartEvent(message_id=message_id, role="assistant"))
+                events.append(TextMessageContentEvent(message_id=message_id, delta=text))
+                events.append(TextMessageEndEvent(message_id=message_id))
+        return events
+
+    def _translate_tool_use(
+        self, message_id: str, block_index: int, content_index: int, content: dict
+    ) -> list[BaseEvent]:
+        """Map one ``tool_use`` content block to tool-call lifecycle events.
+
+        ``ToolContent`` has no id, so a stable tool-call id is derived from the
+        tool's position in the (append-only) content_blocks structure.
+        """
+        tool_call_id = f"{message_id}:tool:{block_index}:{content_index}"
+        events: list[BaseEvent] = []
+
+        if tool_call_id not in self._started_tool_calls:
+            self._started_tool_calls.add(tool_call_id)
+            tool_input = content.get("tool_input")
+            if tool_input is None:
+                tool_input = content.get("input")
+            events.append(
+                ToolCallStartEvent(
+                    tool_call_id=tool_call_id,
+                    tool_call_name=content.get("name") or "tool",
+                    parent_message_id=message_id,
+                )
+            )
+            events.append(ToolCallArgsEvent(tool_call_id=tool_call_id, delta=json.dumps(tool_input)))
+            events.append(ToolCallEndEvent(tool_call_id=tool_call_id))
+
+        if tool_call_id not in self._resulted_tool_calls:
+            error = content.get("error")
+            result = error if error is not None else content.get("output")
+            if result is not None:
+                self._resulted_tool_calls.add(tool_call_id)
+                events.append(
+                    ToolCallResultEvent(
+                        message_id=message_id,
+                        tool_call_id=tool_call_id,
+                        content=result if isinstance(result, str) else json.dumps(result),
+                    )
+                )
+        return events
 
     @staticmethod
     def _set_node(node_id: str, status: str, output: object) -> dict:

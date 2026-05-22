@@ -19,6 +19,10 @@ from ag_ui.core import (
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
+    ToolCallArgsEvent,
+    ToolCallEndEvent,
+    ToolCallResultEvent,
+    ToolCallStartEvent,
 )
 from langflow.api.v2.agui_translator import AGUITranslator
 
@@ -259,3 +263,151 @@ def test_end_vertex_does_not_close_open_text_message():
     assert all(not isinstance(e, TextMessageStartEvent) for e in more)
     assert isinstance(more[0], TextMessageContentEvent)
     assert more[0].message_id == "m1"
+
+
+def test_add_message_plain_text_emits_a_text_message():
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    out = t.translate("add_message", {"id": "m1", "text": "The weather is sunny."})
+
+    assert isinstance(out[0], TextMessageStartEvent)
+    assert out[0].message_id == "m1"
+    assert isinstance(out[1], TextMessageContentEvent)
+    assert out[1].delta == "The weather is sunny."
+    assert isinstance(out[2], TextMessageEndEvent)
+    assert out[2].message_id == "m1"
+
+
+def test_add_message_finalizing_a_streamed_message_does_not_duplicate_text():
+    """A streamed message's add_message finalizer only closes it, never re-emits text."""
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    t.translate("token", {"chunk": "The weather ", "id": "m1"})
+    t.translate("token", {"chunk": "is sunny.", "id": "m1"})
+    out = t.translate("add_message", {"id": "m1", "text": "The weather is sunny."})
+
+    assert all(not isinstance(e, TextMessageStartEvent) for e in out)
+    assert all(not isinstance(e, TextMessageContentEvent) for e in out)
+    assert isinstance(out[0], TextMessageEndEvent)
+    assert out[0].message_id == "m1"
+
+
+def test_add_message_tool_use_emits_tool_call_lifecycle():
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    out = t.translate(
+        "add_message",
+        {
+            "id": "m1",
+            "text": "",
+            "content_blocks": [
+                {
+                    "title": "Agent Steps",
+                    "contents": [
+                        {
+                            "type": "tool_use",
+                            "name": "search",
+                            "tool_input": {"query": "weather"},
+                            "output": "sunny",
+                            "error": None,
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    starts = [e for e in out if isinstance(e, ToolCallStartEvent)]
+    args = [e for e in out if isinstance(e, ToolCallArgsEvent)]
+    ends = [e for e in out if isinstance(e, ToolCallEndEvent)]
+    results = [e for e in out if isinstance(e, ToolCallResultEvent)]
+    assert len(starts) == 1
+    assert starts[0].tool_call_name == "search"
+    assert starts[0].parent_message_id == "m1"
+    assert len(args) == 1
+    assert "weather" in args[0].delta
+    assert len(ends) == 1
+    assert len(results) == 1
+    assert "sunny" in results[0].content
+    # The four events share one tool_call_id.
+    assert {starts[0].tool_call_id, args[0].tool_call_id, ends[0].tool_call_id, results[0].tool_call_id} == {
+        starts[0].tool_call_id
+    }
+
+
+def test_tool_use_error_is_reported_via_tool_call_result():
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    out = t.translate(
+        "add_message",
+        {
+            "id": "m1",
+            "content_blocks": [
+                {
+                    "title": "Agent Steps",
+                    "contents": [
+                        {
+                            "type": "tool_use",
+                            "name": "search",
+                            "tool_input": {},
+                            "output": None,
+                            "error": "rate limited",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    results = [e for e in out if isinstance(e, ToolCallResultEvent)]
+    assert len(results) == 1
+    assert "rate limited" in results[0].content
+
+
+def test_repeated_add_message_does_not_re_emit_the_same_tool_call():
+    """A tool call already emitted is not re-emitted when add_message re-fires."""
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    payload = {
+        "id": "m1",
+        "content_blocks": [
+            {
+                "title": "Agent Steps",
+                "contents": [
+                    {"type": "tool_use", "name": "search", "tool_input": {"q": "x"}, "output": "done", "error": None}
+                ],
+            }
+        ],
+    }
+    first = t.translate("add_message", payload)
+    second = t.translate("add_message", payload)
+
+    assert len([e for e in first if isinstance(e, ToolCallStartEvent)]) == 1
+    assert second == []
+
+
+def test_repeated_add_message_after_streamed_finalizer_does_not_duplicate_text():
+    """A streamed message finalized once must not re-emit text on a later add_message."""
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    t.translate("token", {"chunk": "Hello", "id": "m1"})
+    t.translate("add_message", {"id": "m1", "text": "Hello"})  # finalizes the streamed message
+    again = t.translate("add_message", {"id": "m1", "text": "Hello"})  # re-fire
+
+    assert again == []
+
+
+def test_malformed_content_block_is_skipped_not_crashed():
+    """A null or non-dict entry in content_blocks is skipped, not fatal."""
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    out = t.translate("add_message", {"id": "m1", "text": "hi", "content_blocks": [None, "garbage"]})
+
+    assert any(isinstance(e, TextMessageStartEvent) for e in out)
