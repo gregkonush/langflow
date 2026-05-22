@@ -22,9 +22,11 @@ Internal Helpers:
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from ag_ui.core import RunAgentInput
 from lfx.schema.workflow import (
     ComponentOutput,
     ErrorDetail,
@@ -39,6 +41,52 @@ if TYPE_CHECKING:
     from lfx.graph.graph.base import Graph
 
     from langflow.api.v1.schemas import RunResponse
+
+
+@dataclass(frozen=True)
+class ParsedWorkflowRun:
+    """Langflow run parameters extracted from an AG-UI ``RunAgentInput``."""
+
+    flow_id: str | None
+    tweaks: dict[str, Any] = field(default_factory=dict)
+    input_value: str = ""
+    session_id: str | None = None
+    run_id: str | None = None
+    mode: str = "stream"
+    start_component_id: str | None = None
+    stop_component_id: str | None = None
+
+
+def parse_run_agent_input(run_input: RunAgentInput) -> ParsedWorkflowRun:
+    """Extract Langflow run parameters from a strict AG-UI ``RunAgentInput``.
+
+    The AG-UI body carries Langflow-specific fields in ``forwardedProps``; the
+    user's chat input is the last user message; the session is the ``threadId``.
+
+    Args:
+        run_input: The AG-UI request body.
+
+    Returns:
+        ParsedWorkflowRun: the Langflow run parameters.
+    """
+    forwarded = run_input.forwarded_props if isinstance(run_input.forwarded_props, dict) else {}
+
+    input_value = ""
+    for message in reversed(run_input.messages or []):
+        if getattr(message, "role", None) == "user":
+            input_value = getattr(message, "content", "") or ""
+            break
+
+    return ParsedWorkflowRun(
+        flow_id=forwarded.get("flow_id"),
+        tweaks=forwarded.get("tweaks") or {},
+        input_value=input_value,
+        session_id=run_input.thread_id,
+        run_id=run_input.run_id,
+        mode=forwarded.get("mode", "stream"),
+        start_component_id=forwarded.get("start_component_id"),
+        stop_component_id=forwarded.get("stop_component_id"),
+    )
 
 
 def parse_flat_inputs(inputs: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], str | None]:
