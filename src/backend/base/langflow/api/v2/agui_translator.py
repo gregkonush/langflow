@@ -15,6 +15,7 @@ import json
 
 from ag_ui.core import (
     BaseEvent,
+    CustomEvent,
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
@@ -30,6 +31,10 @@ from ag_ui.core import (
     ToolCallResultEvent,
     ToolCallStartEvent,
 )
+
+# Langflow content-block types with no standard AG-UI primitive. They ride as
+# CUSTOM events namespaced ``langflow.*``; generic AG-UI clients ignore them.
+_CUSTOM_CONTENT_TYPES = frozenset({"json", "code", "media", "error"})
 
 
 class AGUITranslator:
@@ -52,6 +57,9 @@ class AGUITranslator:
         # (append-only) content_blocks, so emissions must be deduplicated.
         self._started_tool_calls: set[str] = set()
         self._resulted_tool_calls: set[str] = set()
+        # Custom content blocks already emitted as CUSTOM events, mapped to a
+        # fingerprint of their last-emitted payload so in-place updates re-emit.
+        self._emitted_content_state: dict[str, str] = {}
 
     def start(self) -> list[BaseEvent]:
         """Open the run.
@@ -77,6 +85,10 @@ class AGUITranslator:
             return self._translate_end_vertex(data)
         if event_type == "add_message":
             return self._translate_add_message(data)
+        if event_type == "log":
+            return [CustomEvent(name="langflow.log", value=data)]
+        if event_type == "remove_message":
+            return [CustomEvent(name="langflow.message.removed", value={"message_id": str(data.get("id") or "")})]
 
         # Only terminal events close an open text message. Non-terminal events
         # (build_start, end_vertex, log, ...) interleave with tokens of the same
@@ -158,13 +170,21 @@ class AGUITranslator:
         message_id = str(data.get("id") or "")
         events: list[BaseEvent] = []
 
-        # Tool-use content blocks become tool-call lifecycle events.
+        # Content blocks: tool_use becomes tool-call events, the Langflow-specific
+        # content types become namespaced CUSTOM events.
         for block_index, block in enumerate(data.get("content_blocks") or []):
             if not isinstance(block, dict):
                 continue
             for content_index, content in enumerate(block.get("contents") or []):
-                if isinstance(content, dict) and content.get("type") == "tool_use":
+                if not isinstance(content, dict):
+                    continue
+                content_type = content.get("type")
+                if content_type == "tool_use":
                     events.extend(self._translate_tool_use(message_id, block_index, content_index, content))
+                elif content_type in _CUSTOM_CONTENT_TYPES:
+                    events.extend(
+                        self._translate_custom_content(message_id, block, block_index, content_index, content)
+                    )
 
         # Message text.
         if message_id and message_id == self._open_message_id:
@@ -221,6 +241,26 @@ class AGUITranslator:
                     )
                 )
         return events
+
+    def _translate_custom_content(
+        self, message_id: str, block: dict, block_index: int, content_index: int, content: dict
+    ) -> list[BaseEvent]:
+        """Map a Langflow-specific content block to a namespaced CUSTOM event.
+
+        Deduplicated by content state: a re-fired ``add_message`` whose block is
+        unchanged emits nothing, but an in-place update to the block re-emits.
+        """
+        key = f"{message_id}:content:{block_index}:{content_index}"
+        fingerprint = json.dumps(content, sort_keys=True, default=str)
+        if self._emitted_content_state.get(key) == fingerprint:
+            return []
+        self._emitted_content_state[key] = fingerprint
+        return [
+            CustomEvent(
+                name=f"langflow.content.{content['type']}",
+                value={"message_id": message_id, "block_title": block.get("title"), "content": content},
+            )
+        ]
 
     @staticmethod
     def _set_node(node_id: str, status: str, output: object) -> dict:

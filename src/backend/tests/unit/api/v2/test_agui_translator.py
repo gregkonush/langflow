@@ -9,6 +9,7 @@ stateful transformation with no I/O.
 from __future__ import annotations
 
 from ag_ui.core import (
+    CustomEvent,
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
@@ -411,3 +412,95 @@ def test_malformed_content_block_is_skipped_not_crashed():
     out = t.translate("add_message", {"id": "m1", "text": "hi", "content_blocks": [None, "garbage"]})
 
     assert any(isinstance(e, TextMessageStartEvent) for e in out)
+
+
+def test_custom_content_types_emit_langflow_custom_events():
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    out = t.translate(
+        "add_message",
+        {
+            "id": "m1",
+            "content_blocks": [
+                {
+                    "title": "Steps",
+                    "contents": [
+                        {"type": "json", "data": {"k": "v"}},
+                        {"type": "code", "code": "print(1)", "language": "python"},
+                        {"type": "media", "urls": ["http://x/img.png"], "caption": "pic"},
+                        {"type": "error", "reason": "boom", "traceback": "trace"},
+                    ],
+                }
+            ],
+        },
+    )
+
+    customs = {e.name: e for e in out if isinstance(e, CustomEvent)}
+    assert set(customs) == {
+        "langflow.content.json",
+        "langflow.content.code",
+        "langflow.content.media",
+        "langflow.content.error",
+    }
+    assert customs["langflow.content.json"].value["message_id"] == "m1"
+    assert customs["langflow.content.json"].value["block_title"] == "Steps"
+    assert customs["langflow.content.code"].value["content"]["code"] == "print(1)"
+
+
+def test_log_event_emits_langflow_log_custom_event():
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    out = t.translate("log", {"message": "hi", "type": "text", "name": "Log 1", "component_id": "c1"})
+
+    assert len(out) == 1
+    assert isinstance(out[0], CustomEvent)
+    assert out[0].name == "langflow.log"
+    assert out[0].value["component_id"] == "c1"
+
+
+def test_remove_message_emits_langflow_removed_custom_event():
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    out = t.translate("remove_message", {"id": "m9"})
+
+    assert len(out) == 1
+    assert isinstance(out[0], CustomEvent)
+    assert out[0].name == "langflow.message.removed"
+    assert out[0].value["message_id"] == "m9"
+
+
+def test_repeated_custom_content_block_is_not_re_emitted():
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+    payload = {
+        "id": "m1",
+        "content_blocks": [{"title": "Steps", "contents": [{"type": "json", "data": {"k": "v"}}]}],
+    }
+
+    first = t.translate("add_message", payload)
+    second = t.translate("add_message", payload)
+
+    assert len([e for e in first if isinstance(e, CustomEvent)]) == 1
+    assert second == []
+
+
+def test_updated_custom_content_block_is_re_emitted():
+    """If a content block's payload changes on a later add_message, the update is emitted."""
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    t.translate(
+        "add_message",
+        {"id": "m1", "content_blocks": [{"title": "S", "contents": [{"type": "json", "data": {}}]}]},
+    )
+    out = t.translate(
+        "add_message",
+        {"id": "m1", "content_blocks": [{"title": "S", "contents": [{"type": "json", "data": {"k": "v"}}]}]},
+    )
+
+    customs = [e for e in out if isinstance(e, CustomEvent)]
+    assert len(customs) == 1
+    assert customs[0].value["content"]["data"] == {"k": "v"}
