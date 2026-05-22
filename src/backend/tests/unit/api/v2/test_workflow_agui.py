@@ -330,3 +330,52 @@ class TestAGUISyncExecution:
         assert isinstance(result["outputs"], dict)
         # The chatbot flow produced at least one terminal output.
         assert result["outputs"]
+
+
+class TestAGUICancellation:
+    """A run can be stopped by job id, and a streaming client can disconnect."""
+
+    async def test_background_run_can_be_stopped(
+        self,
+        client: AsyncClient,
+        created_api_key,
+        chatbot_flow,
+    ):
+        """POST /workflows/stop cancels a background run by its job id."""
+        headers = {"x-api-key": created_api_key.api_key}
+        start = await client.post(
+            "api/v2/workflows",
+            json=_agui_body(chatbot_flow, mode="background"),
+            headers=headers,
+        )
+        assert start.status_code == 200
+        job_id = start.json()["job_id"]
+
+        stop = await client.post("api/v2/workflows/stop", json={"job_id": job_id}, headers=headers)
+
+        assert stop.status_code == 200
+        assert "cancelled" in stop.json()["message"].lower()
+
+    async def test_streaming_client_can_disconnect_early(
+        self,
+        client: AsyncClient,
+        created_api_key,
+        chatbot_flow,
+    ):
+        """Closing the SSE stream after the first event does not error the server."""
+        headers = {"x-api-key": created_api_key.api_key}
+        seen: list[str] = []
+        async with client.stream(
+            "POST",
+            "api/v2/workflows",
+            json=_agui_body(chatbot_flow, message="hi", mode="stream"),
+            headers=headers,
+        ) as response:
+            assert response.status_code == 200
+            async for line in response.aiter_lines():
+                if line.startswith("data:"):
+                    seen.append(line)
+                    break  # disconnect mid-stream
+
+        # The stream delivered at least one event before the client disconnected.
+        assert seen
