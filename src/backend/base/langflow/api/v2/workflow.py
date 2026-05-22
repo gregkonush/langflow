@@ -21,13 +21,19 @@ Configuration:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
+import time
+from collections.abc import AsyncIterator
 from copy import deepcopy
 from typing import Annotated
 from uuid import UUID, uuid4
 
 from ag_ui.core import RunAgentInput
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import EventSourceResponse, StreamingResponse
+from fastapi.sse import format_sse_event
+from lfx.events.event_manager import create_default_event_manager
 from lfx.graph.graph.base import Graph
 from lfx.schema.schema import InputValueRequest
 from lfx.schema.workflow import (
@@ -46,6 +52,7 @@ from sqlalchemy.exc import OperationalError
 
 from langflow.api.utils import extract_global_variables_from_headers
 from langflow.api.v1.schemas import RunResponse
+from langflow.api.v2.agui_translator import AGUITranslator
 from langflow.api.v2.converters import (
     ParsedWorkflowRun,
     create_error_response,
@@ -169,14 +176,13 @@ async def execute_workflow(
                 http_request=http_request,
             )
 
-        # Streaming mode (default) - implemented in a later task
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail={
-                "error": "Not implemented",
-                "code": "NOT_IMPLEMENTED",
-                "message": "Streaming execution not yet implemented",
-            },
+        # Streaming mode (default)
+        return _execute_streaming_workflow(
+            parsed=parsed,
+            flow=flow,
+            job_id=job_id,
+            current_user=current_user,
+            http_request=http_request,
         )
 
     except HTTPException as e:
@@ -491,6 +497,114 @@ async def execute_workflow_background(
         raise WorkflowValidationError(str(exc)) from exc
     except MemoryError as exc:
         raise WorkflowResourceError from exc
+
+
+def _execute_streaming_workflow(
+    *,
+    parsed: ParsedWorkflowRun,
+    flow: FlowRead,
+    job_id: UUID,
+    current_user: UserRead,
+    http_request: Request,
+) -> EventSourceResponse:
+    """Run a workflow and stream AG-UI events over server-sent events.
+
+    The graph is built synchronously so build failures surface as HTTP errors.
+    The run itself happens in a background task that feeds a Langflow
+    ``EventManager`` queue; the response generator drains that queue, translates
+    each event to AG-UI, and yields it as a server-sent event. A failure during
+    the run becomes a ``RUN_ERROR`` event, not an HTTP error.
+
+    Args:
+        parsed: The parsed AG-UI run parameters.
+        flow: The flow to execute.
+        job_id: Generated job ID, used as the graph run id and translator fallback.
+        current_user: Authenticated user.
+        http_request: The HTTP request object for extracting headers.
+
+    Returns:
+        An ``EventSourceResponse`` streaming AG-UI events.
+
+    Raises:
+        WorkflowValidationError: If flow data is missing or the graph fails to build.
+    """
+    if flow.data is None:
+        msg = f"Flow {flow.id} has no data. The flow may be corrupted."
+        raise WorkflowValidationError(msg)
+
+    request_variables = extract_global_variables_from_headers(http_request.headers)
+    context = {"request_variables": request_variables} if request_variables else None
+
+    try:
+        flow_id_str = str(flow.id)
+        graph_data = deepcopy(flow.data)
+        graph_data = process_tweaks(graph_data, parsed.tweaks, stream=False)
+        graph = Graph.from_payload(
+            graph_data, flow_id=flow_id_str, user_id=str(current_user.id), flow_name=flow.name, context=context
+        )
+        graph.set_run_id(job_id)
+    except Exception as e:
+        msg = f"Failed to build graph from flow data: {e!s}"
+        raise WorkflowValidationError(msg) from e
+
+    terminal_node_ids = graph.get_terminal_nodes()
+    queue: asyncio.Queue = asyncio.Queue()
+    event_manager = create_default_event_manager(queue)
+    translator = AGUITranslator(run_id=parsed.run_id or str(job_id), thread_id=parsed.session_id or flow_id_str)
+
+    async def drive_graph_run() -> None:
+        """Run the graph, then signal end-of-stream on the queue."""
+        try:
+            await run_graph_internal(
+                graph=graph,
+                flow_id=flow_id_str,
+                session_id=parsed.session_id,
+                inputs=_build_run_inputs(parsed),
+                outputs=terminal_node_ids,
+                stream=True,
+                event_manager=event_manager,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            event_manager.on_error(data={"error": str(exc)})
+        else:
+            event_manager.on_end(data={})
+        await queue.put((None, None, time.time()))
+
+    def _frame(ag_event: object, seq: int) -> bytes:
+        """Encode one AG-UI event as an SSE frame (pre-serialized camelCase JSON)."""
+        return format_sse_event(
+            data_str=ag_event.model_dump_json(by_alias=True, exclude_none=True),
+            id=str(seq),
+        )
+
+    async def event_stream() -> AsyncIterator[bytes]:
+        """Drain the event queue, translate to AG-UI, yield SSE frames."""
+        seq = 0
+        run_task = asyncio.create_task(drive_graph_run())
+        try:
+            for ag_event in translator.start():
+                yield _frame(ag_event, seq)
+                seq += 1
+            while True:
+                _, value, _ = await queue.get()
+                if value is None:
+                    break
+                payload = json.loads(value.decode("utf-8"))
+                for ag_event in translator.translate(payload.get("event", ""), payload.get("data") or {}):
+                    yield _frame(ag_event, seq)
+                    seq += 1
+        finally:
+            if not run_task.done():
+                run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run_task
+
+    return EventSourceResponse(
+        event_stream(),
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get(

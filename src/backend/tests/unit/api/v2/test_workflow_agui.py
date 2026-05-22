@@ -10,6 +10,7 @@ Execution mode is carried in ``forwardedProps.mode``:
     - ``stream``     -> SSE (added in a later task)
 """
 
+import json
 from uuid import uuid4
 
 import pytest
@@ -191,7 +192,7 @@ class TestAGUIModeDispatch:
         created_api_key,
         empty_flow,
     ):
-        """Omitting mode defaults to stream; streaming is not implemented yet (501)."""
+        """Omitting mode defaults to stream: a text/event-stream response."""
         body = _agui_body(empty_flow)
         body["forwardedProps"].pop("mode")
         response = await client.post(
@@ -200,4 +201,85 @@ class TestAGUIModeDispatch:
             headers={"x-api-key": created_api_key.api_key},
         )
 
-        assert response.status_code == 501
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+
+
+class TestAGUIStreaming:
+    """mode=stream returns an AG-UI server-sent event stream."""
+
+    async def test_stream_emits_run_lifecycle_events(
+        self,
+        client: AsyncClient,
+        created_api_key,
+        empty_flow,
+    ):
+        """A streamed run brackets its events with RUN_STARTED and RUN_FINISHED."""
+        response = await client.post(
+            "api/v2/workflows",
+            json=_agui_body(empty_flow, mode="stream"),
+            headers={"x-api-key": created_api_key.api_key},
+        )
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        body = response.text
+        assert "RUN_STARTED" in body
+        assert "RUN_FINISHED" in body
+
+    async def test_stream_unknown_flow_returns_404(
+        self,
+        client: AsyncClient,
+        created_api_key,
+    ):
+        """A stream-mode request for a missing flow fails before streaming starts."""
+        response = await client.post(
+            "api/v2/workflows",
+            json=_agui_body("550e8400-e29b-41d4-a716-446655440000", mode="stream"),
+            headers={"x-api-key": created_api_key.api_key},
+        )
+
+        assert response.status_code == 404
+        assert response.json()["detail"]["code"] == "FLOW_NOT_FOUND"
+
+    async def test_stream_real_flow_runs_without_error(
+        self,
+        client: AsyncClient,
+        created_api_key,
+        json_memory_chatbot_no_llm,
+    ):
+        """Streaming a real no-LLM chatbot flow runs the graph end-to-end with no RUN_ERROR."""
+        raw = json.loads(json_memory_chatbot_no_llm)
+        flow_data = raw.get("data", raw)
+        flow_id = uuid4()
+        async with session_scope() as session:
+            flow = Flow(
+                id=flow_id,
+                name="AG-UI Memory Chatbot Flow",
+                data=flow_data,
+                user_id=created_api_key.user_id,
+            )
+            session.add(flow)
+            await session.flush()
+
+        try:
+            response = await client.post(
+                "api/v2/workflows",
+                json=_agui_body(flow_id, message="hello from agui", mode="stream"),
+                headers={"x-api-key": created_api_key.api_key},
+            )
+
+            assert response.status_code == 200
+            body = response.text
+            assert "RUN_STARTED" in body
+            assert "RUN_FINISHED" in body
+            assert "RUN_ERROR" not in body
+            # The ChatOutput component's message reached the stream as AG-UI
+            # text-message events, proving the real event pipeline works.
+            assert "TEXT_MESSAGE_START" in body
+            assert "TEXT_MESSAGE_CONTENT" in body
+        finally:
+            async with session_scope() as session:
+                flow = await session.get(Flow, flow_id)
+                if flow:
+                    await session.delete(flow)
