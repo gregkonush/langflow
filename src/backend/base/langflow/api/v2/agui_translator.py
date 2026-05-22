@@ -11,7 +11,15 @@ list. The translator is stateful: one instance per run.
 
 from __future__ import annotations
 
-from ag_ui.core import BaseEvent, RunErrorEvent, RunFinishedEvent, RunStartedEvent
+from ag_ui.core import (
+    BaseEvent,
+    RunErrorEvent,
+    RunFinishedEvent,
+    RunStartedEvent,
+    TextMessageContentEvent,
+    TextMessageEndEvent,
+    TextMessageStartEvent,
+)
 
 
 class AGUITranslator:
@@ -24,6 +32,9 @@ class AGUITranslator:
     def __init__(self, run_id: str, thread_id: str) -> None:
         self.run_id = run_id
         self.thread_id = thread_id
+        # Id of the text message currently being streamed by ``token`` events,
+        # or ``None`` when no message is open.
+        self._open_message_id: str | None = None
 
     def start(self) -> list[BaseEvent]:
         """Open the run. Emits ``RUN_STARTED``."""
@@ -31,12 +42,47 @@ class AGUITranslator:
 
     def translate(self, event_type: str, data: dict) -> list[BaseEvent]:
         """Map one ``EventManager`` event to zero or more AG-UI events."""
+        if event_type == "token":
+            return self._translate_token(data)
+
+        # Only terminal events close an open text message. Non-terminal events
+        # (build_start, end_vertex, log, ...) interleave with tokens of the same
+        # streamed message and must stay transparent, or the message would be
+        # split into multiple START/END pairs reusing an already-ended id.
         if event_type == "end":
-            return [RunFinishedEvent(run_id=self.run_id, thread_id=self.thread_id)]
+            events = self._close_open_message()
+            events.append(RunFinishedEvent(run_id=self.run_id, thread_id=self.thread_id))
+            return events
         if event_type == "error":
+            events = self._close_open_message()
             # The ``error`` payload varies by emission path: a full ErrorMessage
             # dump carries the reason in ``text``; the minimal path sends
             # ``{"error": str}``.
             message = data.get("text") or data.get("error") or "Unknown error"
-            return [RunErrorEvent(message=str(message))]
+            events.append(RunErrorEvent(message=str(message)))
+            return events
         return []
+
+    def _translate_token(self, data: dict) -> list[BaseEvent]:
+        """Map a ``token`` event to text-message events.
+
+        The first token of a message opens it with ``TEXT_MESSAGE_START``; a
+        token for a different message id closes the previous one first.
+        """
+        message_id = str(data.get("id", ""))
+        chunk = data.get("chunk", "")
+        events: list[BaseEvent] = []
+        if self._open_message_id != message_id:
+            events.extend(self._close_open_message())
+            events.append(TextMessageStartEvent(message_id=message_id, role="assistant"))
+            self._open_message_id = message_id
+        events.append(TextMessageContentEvent(message_id=message_id, delta=chunk))
+        return events
+
+    def _close_open_message(self) -> list[BaseEvent]:
+        """Emit ``TEXT_MESSAGE_END`` for the open message, if any."""
+        if self._open_message_id is None:
+            return []
+        end = TextMessageEndEvent(message_id=self._open_message_id)
+        self._open_message_id = None
+        return [end]
