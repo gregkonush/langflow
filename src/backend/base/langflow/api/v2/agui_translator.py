@@ -16,7 +16,10 @@ from ag_ui.core import (
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
+    StateDeltaEvent,
     StateSnapshotEvent,
+    StepFinishedEvent,
+    StepStartedEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
@@ -38,8 +41,16 @@ class AGUITranslator:
         self._open_message_id: str | None = None
 
     def start(self) -> list[BaseEvent]:
-        """Open the run. Emits ``RUN_STARTED``."""
-        return [RunStartedEvent(run_id=self.run_id, thread_id=self.thread_id)]
+        """Open the run.
+
+        Emits ``RUN_STARTED`` and an empty node-graph ``STATE_SNAPSHOT``. The
+        snapshot establishes ``/nodes`` so every later node ``STATE_DELTA`` has a
+        parent to patch, regardless of which execution path drives the run.
+        """
+        return [
+            RunStartedEvent(run_id=self.run_id, thread_id=self.thread_id),
+            StateSnapshotEvent(snapshot={"nodes": {}}),
+        ]
 
     def translate(self, event_type: str, data: dict) -> list[BaseEvent]:
         """Map one ``EventManager`` event to zero or more AG-UI events."""
@@ -47,6 +58,10 @@ class AGUITranslator:
             return self._translate_token(data)
         if event_type == "vertices_sorted":
             return self._translate_vertices_sorted(data)
+        if event_type == "build_start":
+            return self._translate_build_start(data)
+        if event_type == "end_vertex":
+            return self._translate_end_vertex(data)
 
         # Only terminal events close an open text message. Non-terminal events
         # (build_start, end_vertex, log, ...) interleave with tokens of the same
@@ -92,6 +107,42 @@ class AGUITranslator:
         node_ids = data.get("to_run") or data.get("ids") or []
         snapshot = {"nodes": {node_id: {"status": "pending", "output": None} for node_id in node_ids}}
         return [StateSnapshotEvent(snapshot=snapshot)]
+
+    def _translate_build_start(self, data: dict) -> list[BaseEvent]:
+        """Map a per-node ``build_start`` to a ``STEP_STARTED`` + a running ``STATE_DELTA``.
+
+        The graph-level ``build_start`` (the ``/build`` path) carries no ``id`` and
+        is a no-op here: ``RUN_STARTED`` already signals the run beginning.
+        """
+        node_id = data.get("id")
+        if not node_id:
+            return []
+        return [
+            StepStartedEvent(step_name=node_id),
+            StateDeltaEvent(delta=[self._set_node(node_id, "running", None)]),
+        ]
+
+    def _translate_end_vertex(self, data: dict) -> list[BaseEvent]:
+        """Map ``end_vertex`` to a ``STEP_FINISHED`` + a ``STATE_DELTA`` for status and output."""
+        build_data = data.get("build_data") or {}
+        node_id = build_data.get("id")
+        if not node_id:
+            return []
+        status = "success" if build_data.get("valid") else "error"
+        return [
+            StepFinishedEvent(step_name=node_id),
+            StateDeltaEvent(delta=[self._set_node(node_id, status, build_data.get("data"))]),
+        ]
+
+    @staticmethod
+    def _set_node(node_id: str, status: str, output: object) -> dict:
+        """Build the RFC 6902 op that writes a node's state.
+
+        ``add`` on ``/nodes/{id}`` is create-or-replace: it applies whether or not
+        the node was pre-seeded by a ``vertices_sorted`` snapshot, so the
+        translator does not depend on event ordering across execution paths.
+        """
+        return {"op": "add", "path": f"/nodes/{node_id}", "value": {"status": status, "output": output}}
 
     def _close_open_message(self) -> list[BaseEvent]:
         """Emit ``TEXT_MESSAGE_END`` for the open message, if any."""
