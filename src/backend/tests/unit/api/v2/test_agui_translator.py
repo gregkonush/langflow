@@ -504,3 +504,110 @@ def test_updated_custom_content_block_is_re_emitted():
     customs = [e for e in out if isinstance(e, CustomEvent)]
     assert len(customs) == 1
     assert customs[0].value["content"]["data"] == {"k": "v"}
+
+
+# --- Full-sequence integration coverage ---------------------------------------
+
+
+def _run_sequence(translator: AGUITranslator, events: list[tuple[str, dict]]) -> list:
+    """Feed start() then a list of (event_type, data) pairs, collecting all output."""
+    out = list(translator.start())
+    for event_type, data in events:
+        out.extend(translator.translate(event_type, data))
+    return out
+
+
+def _assert_well_formed(events: list) -> None:
+    """Assert an emitted AG-UI stream is structurally valid."""
+    assert events, "expected a non-empty event stream"
+    assert isinstance(events[0], RunStartedEvent)
+    assert isinstance(events[-1], (RunFinishedEvent, RunErrorEvent))
+
+    open_messages: set[str] = set()
+    seen_messages: set[str] = set()
+    for event in events:
+        if isinstance(event, TextMessageStartEvent):
+            assert event.message_id not in open_messages, "text message started while already open"
+            assert event.message_id not in seen_messages, "text message id reused after it ended"
+            open_messages.add(event.message_id)
+            seen_messages.add(event.message_id)
+        elif isinstance(event, TextMessageContentEvent):
+            assert event.message_id in open_messages, "text content for a message that is not open"
+        elif isinstance(event, TextMessageEndEvent):
+            assert event.message_id in open_messages, "text message ended without being open"
+            open_messages.discard(event.message_id)
+    assert not open_messages, "text messages left unclosed"
+
+    started_tools: set[str] = set()
+    ended_tools: set[str] = set()
+    for event in events:
+        if isinstance(event, ToolCallStartEvent):
+            assert event.tool_call_id not in started_tools, "tool call started twice"
+            started_tools.add(event.tool_call_id)
+        elif isinstance(event, ToolCallArgsEvent):
+            assert event.tool_call_id in started_tools, "tool args before tool start"
+        elif isinstance(event, ToolCallEndEvent):
+            ended_tools.add(event.tool_call_id)
+    assert started_tools == ended_tools, "every tool call needs a matching START and END"
+
+
+_AGENT_STEPS = [
+    {
+        "title": "Agent Steps",
+        "contents": [
+            {"type": "tool_use", "name": "search", "tool_input": {"q": "weather"}, "output": "sunny", "error": None}
+        ],
+    }
+]
+
+
+def test_full_agent_flow_sequence_is_well_formed():
+    """A realistic ChatInput -> Agent -> ChatOutput run yields a well-formed stream."""
+    t = AGUITranslator(run_id="run-1", thread_id="sess-1")
+    sequence = [
+        ("vertices_sorted", {"ids": ["ChatInput-a"], "to_run": ["ChatInput-a", "Agent-b", "ChatOutput-c"]}),
+        ("build_start", {}),
+        ("end_vertex", {"build_data": {"id": "ChatInput-a", "valid": True, "data": {"outputs": {}}}}),
+        # The agent surfaces its tool step on a partial message update.
+        ("add_message", {"id": "m1", "text": "", "properties": {"state": "partial"}, "content_blocks": _AGENT_STEPS}),
+        # The agent streams its final answer token by token.
+        ("token", {"chunk": "It is ", "id": "m1"}),
+        ("token", {"chunk": "sunny.", "id": "m1"}),
+        # The complete message finalizes the streamed answer.
+        (
+            "add_message",
+            {"id": "m1", "text": "It is sunny.", "properties": {"state": "complete"}, "content_blocks": _AGENT_STEPS},
+        ),
+        ("end_vertex", {"build_data": {"id": "Agent-b", "valid": True, "data": {"outputs": {}}}}),
+        ("end_vertex", {"build_data": {"id": "ChatOutput-c", "valid": True, "data": {"outputs": {}}}}),
+        ("end", {"build_duration": 1.23}),
+    ]
+
+    out = _run_sequence(t, sequence)
+
+    _assert_well_formed(out)
+    assert isinstance(out[-1], RunFinishedEvent)
+    # The tool call appears in two add_message events but is emitted exactly once.
+    assert len([e for e in out if isinstance(e, ToolCallStartEvent)]) == 1
+    assert len([e for e in out if isinstance(e, ToolCallResultEvent)]) == 1
+    # The streamed message has exactly one START/END pair.
+    assert len([e for e in out if isinstance(e, TextMessageStartEvent)]) == 1
+    assert len([e for e in out if isinstance(e, TextMessageEndEvent)]) == 1
+    # Every node ran: three STEP_FINISHED events.
+    assert len([e for e in out if isinstance(e, StepFinishedEvent)]) == 3
+
+
+def test_full_sequence_ending_in_error_is_well_formed():
+    """A run that errors mid-stream still closes the open message and ends in RUN_ERROR."""
+    t = AGUITranslator(run_id="run-2", thread_id="sess-2")
+    sequence = [
+        ("vertices_sorted", {"ids": ["ChatInput-a"], "to_run": ["ChatInput-a", "Agent-b"]}),
+        ("token", {"chunk": "partial answer", "id": "m1"}),
+        ("error", {"text": "the agent crashed"}),
+    ]
+
+    out = _run_sequence(t, sequence)
+
+    _assert_well_formed(out)
+    assert isinstance(out[-1], RunErrorEvent)
+    assert "the agent crashed" in out[-1].message
