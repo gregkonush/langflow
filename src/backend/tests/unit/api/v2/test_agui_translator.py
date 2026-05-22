@@ -12,6 +12,7 @@ from ag_ui.core import (
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
+    StateSnapshotEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
@@ -131,3 +132,29 @@ def test_interleaved_non_terminal_event_does_not_split_open_message():
     assert isinstance(more[0], TextMessageContentEvent)
     assert more[0].message_id == "m1"
     assert more[0].delta == "lo"
+
+
+def test_vertices_sorted_emits_state_snapshot_of_all_nodes():
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    out = t.translate("vertices_sorted", {"ids": ["a"], "to_run": ["a", "b", "c"]})
+
+    assert len(out) == 1
+    assert isinstance(out[0], StateSnapshotEvent)
+    nodes = out[0].snapshot["nodes"]
+    # The snapshot covers the full run set (to_run), not just the first layer.
+    assert set(nodes) == {"a", "b", "c"}
+    for node in nodes.values():
+        assert node["status"] == "pending"
+        assert node["output"] is None
+
+
+def test_vertices_sorted_falls_back_to_ids_when_to_run_absent():
+    t = AGUITranslator(run_id="r1", thread_id="t1")
+    t.start()
+
+    out = t.translate("vertices_sorted", {"ids": ["a", "b"]})
+
+    assert isinstance(out[0], StateSnapshotEvent)
+    assert set(out[0].snapshot["nodes"]) == {"a", "b"}

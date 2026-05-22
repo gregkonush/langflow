@@ -16,6 +16,7 @@ from ag_ui.core import (
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
+    StateSnapshotEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
@@ -44,6 +45,8 @@ class AGUITranslator:
         """Map one ``EventManager`` event to zero or more AG-UI events."""
         if event_type == "token":
             return self._translate_token(data)
+        if event_type == "vertices_sorted":
+            return self._translate_vertices_sorted(data)
 
         # Only terminal events close an open text message. Non-terminal events
         # (build_start, end_vertex, log, ...) interleave with tokens of the same
@@ -78,6 +81,17 @@ class AGUITranslator:
             self._open_message_id = message_id
         events.append(TextMessageContentEvent(message_id=message_id, delta=chunk))
         return events
+
+    def _translate_vertices_sorted(self, data: dict) -> list[BaseEvent]:
+        """Map ``vertices_sorted`` to a ``STATE_SNAPSHOT`` of the node graph.
+
+        Seeds every node that will run with ``pending`` status so the canvas can
+        render the graph before execution begins. ``to_run`` is the full run set;
+        ``ids`` (the first layer only) is the fallback.
+        """
+        node_ids = data.get("to_run") or data.get("ids") or []
+        snapshot = {"nodes": {node_id: {"status": "pending", "output": None} for node_id in node_ids}}
+        return [StateSnapshotEvent(snapshot=snapshot)]
 
     def _close_open_message(self) -> list[BaseEvent]:
         """Emit ``TEXT_MESSAGE_END`` for the open message, if any."""
