@@ -58,6 +58,28 @@ async def empty_flow(created_api_key):
             await session.delete(flow)
 
 
+@pytest.fixture
+async def chatbot_flow(created_api_key, json_memory_chatbot_no_llm):
+    """Create a real no-LLM chatbot flow (ChatInput -> Prompt/Memory -> ChatOutput)."""
+    raw = json.loads(json_memory_chatbot_no_llm)
+    flow_id = uuid4()
+    async with session_scope() as session:
+        flow = Flow(
+            id=flow_id,
+            name="AG-UI Chatbot Flow",
+            description="No-LLM chatbot flow for AG-UI endpoint tests",
+            data=raw.get("data", raw),
+            user_id=created_api_key.user_id,
+        )
+        session.add(flow)
+        await session.flush()
+    yield flow_id
+    async with session_scope() as session:
+        flow = await session.get(Flow, flow_id)
+        if flow:
+            await session.delete(flow)
+
+
 class TestAGUIRequestContract:
     """The endpoint accepts the AG-UI RunAgentInput body shape."""
 
@@ -283,3 +305,28 @@ class TestAGUIStreaming:
                 flow = await session.get(Flow, flow_id)
                 if flow:
                     await session.delete(flow)
+
+
+class TestAGUISyncExecution:
+    """mode=sync runs the flow inline and folds outputs into the response."""
+
+    async def test_sync_real_flow_returns_completed_with_outputs(
+        self,
+        client: AsyncClient,
+        created_api_key,
+        chatbot_flow,
+    ):
+        """A sync run of a real chatbot flow completes with the terminal outputs."""
+        response = await client.post(
+            "api/v2/workflows",
+            json=_agui_body(chatbot_flow, message="hello from agui", mode="sync"),
+            headers={"x-api-key": created_api_key.api_key},
+        )
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "completed"
+        assert result["errors"] == []
+        assert isinstance(result["outputs"], dict)
+        # The chatbot flow produced at least one terminal output.
+        assert result["outputs"]
