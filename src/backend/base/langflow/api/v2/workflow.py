@@ -60,7 +60,7 @@ from langflow.exceptions.api import (
 )
 from langflow.helpers.flow import get_flow_by_id_or_endpoint_name
 from langflow.processing.process import process_tweaks, run_graph_internal
-from langflow.services.auth.utils import api_key_security
+from langflow.services.auth.utils import get_current_user_for_workflow
 from langflow.services.database.models.flow.model import FlowRead
 from langflow.services.database.models.jobs.model import JobType
 from langflow.services.database.models.user.model import UserRead
@@ -85,7 +85,7 @@ async def execute_workflow(
     workflow_request: WorkflowExecutionRequest,
     background_tasks: BackgroundTasks,
     http_request: Request,
-    api_key_user: Annotated[UserRead, Depends(api_key_security)],
+    current_user: Annotated[UserRead, Depends(get_current_user_for_workflow)],
 ) -> WorkflowExecutionResponse | WorkflowJobResponse | StreamingResponse:
     """Execute a workflow with support for multiple execution modes.
 
@@ -103,7 +103,7 @@ async def execute_workflow(
         workflow_request: The workflow execution request containing flow_id, inputs, and mode flags
         background_tasks: FastAPI background tasks for async operations
         http_request: The HTTP request object for extracting headers
-        api_key_user: Authenticated user from API key
+        current_user: Authenticated user (session cookie or API key)
 
     Returns:
         - WorkflowExecutionResponse: For synchronous execution (HTTP 200)
@@ -123,7 +123,7 @@ async def execute_workflow(
 
     try:
         # Validate flow exists and user has permission
-        flow = await get_flow_by_id_or_endpoint_name(workflow_request.flow_id, api_key_user.id)
+        flow = await get_flow_by_id_or_endpoint_name(workflow_request.flow_id, current_user.id)
 
         # Background mode execution
         if workflow_request.background:
@@ -131,7 +131,7 @@ async def execute_workflow(
                 workflow_request=workflow_request,
                 flow=flow,
                 job_id=job_id,
-                api_key_user=api_key_user,
+                current_user=current_user,
                 http_request=http_request,
             )
 
@@ -151,7 +151,7 @@ async def execute_workflow(
             workflow_request=workflow_request,
             flow=flow,
             job_id=job_id,
-            api_key_user=api_key_user,
+            current_user=current_user,
             background_tasks=background_tasks,
             http_request=http_request,
         )
@@ -237,7 +237,7 @@ async def execute_sync_workflow_with_timeout(
     workflow_request: WorkflowExecutionRequest,
     flow: FlowRead,
     job_id: UUID,
-    api_key_user: UserRead,
+    current_user: UserRead,
     background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> WorkflowExecutionResponse:
@@ -247,7 +247,7 @@ async def execute_sync_workflow_with_timeout(
         workflow_request: The workflow execution request
         flow: The flow to execute
         job_id: Generated job ID for tracking
-        api_key_user: Authenticated user
+        current_user: Authenticated user
         background_tasks: FastAPI background tasks
         http_request: The HTTP request object for extracting headers
 
@@ -264,7 +264,7 @@ async def execute_sync_workflow_with_timeout(
                 workflow_request=workflow_request,
                 flow=flow,
                 job_id=job_id,
-                api_key_user=api_key_user,
+                current_user=current_user,
                 background_tasks=background_tasks,
                 http_request=http_request,
             ),
@@ -278,7 +278,7 @@ async def execute_sync_workflow(
     workflow_request: WorkflowExecutionRequest,
     flow: FlowRead,
     job_id: UUID,
-    api_key_user: UserRead,
+    current_user: UserRead,
     background_tasks: BackgroundTasks,  # noqa: ARG001
     http_request: Request,
 ) -> WorkflowExecutionResponse:
@@ -304,7 +304,7 @@ async def execute_sync_workflow(
         workflow_request: The workflow execution request with inputs and configuration
         flow: The flow model from database
         job_id: Generated job ID for tracking this execution
-        api_key_user: Authenticated user for permission checks
+        current_user: Authenticated user for permission checks
         background_tasks: FastAPI background tasks (unused in sync mode)
         http_request: The HTTP request object for extracting headers
 
@@ -332,7 +332,7 @@ async def execute_sync_workflow(
     # Build graph - system error if this fails
     try:
         flow_id_str = str(flow.id)
-        user_id = str(api_key_user.id)
+        user_id = str(current_user.id)
         # Use deepcopy to prevent mutation of the original flow.data
         # process_tweaks modifies nested dictionaries in-place
         graph_data = deepcopy(flow.data)
@@ -353,7 +353,7 @@ async def execute_sync_workflow(
 
     # Execute graph - component errors are caught and returned in response body
     job_service = get_job_service()
-    await job_service.create_job(job_id=job_id, flow_id=flow_id_str, user_id=api_key_user.id)
+    await job_service.create_job(job_id=job_id, flow_id=flow_id_str, user_id=current_user.id)
     try:
         task_result, execution_session_id = await job_service.execute_with_status(
             job_id=job_id,
@@ -400,7 +400,7 @@ async def execute_workflow_background(
     workflow_request: WorkflowExecutionRequest,
     flow: FlowRead,
     job_id: JobId,
-    api_key_user: UserRead,
+    current_user: UserRead,
     http_request: Request,
 ) -> WorkflowJobResponse:
     """Execute workflow in the background and return job ID for the user to track the execution status."""
@@ -422,7 +422,7 @@ async def execute_workflow_background(
 
         # Build the graph once
         flow_id_str = str(flow.id)
-        user_id = str(api_key_user.id)
+        user_id = str(current_user.id)
         graph_data = deepcopy(flow.data)
         graph_data = process_tweaks(graph_data, tweaks, stream=False)
         graph = Graph.from_payload(
@@ -442,7 +442,7 @@ async def execute_workflow_background(
         await job_service.create_job(
             job_id=job_id,
             flow_id=flow_id_str,
-            user_id=api_key_user.id,
+            user_id=current_user.id,
         )
 
         await task_service.fire_and_forget_task(
@@ -477,14 +477,14 @@ async def execute_workflow_background(
     description="Get status of workflow job by job ID",
 )
 async def get_workflow_status(
-    api_key_user: Annotated[UserRead, Depends(api_key_security)],
+    current_user: Annotated[UserRead, Depends(get_current_user_for_workflow)],
     job_id: Annotated[JobId | None, Query(description="Job ID to query")] = None,
     session: Annotated[object, Depends(injectable_session_scope_readonly)] = None,
 ) -> WorkflowExecutionResponse | WorkflowJobResponse:
     """Get workflow job status and results.
 
     Args:
-        api_key_user: Authenticated user from API key
+        current_user: Authenticated user (session cookie or API key)
         job_id: Optional job ID to query specific job
         session: Database session for querying vertex builds
 
@@ -511,7 +511,7 @@ async def get_workflow_status(
 
     job_service = get_job_service()
     try:
-        job = await job_service.get_job_by_job_id(job_id=job_id, user_id=api_key_user.id)
+        job = await job_service.get_job_by_job_id(job_id=job_id, user_id=current_user.id)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -552,14 +552,14 @@ async def get_workflow_status(
         # If job is completed, reconstruct full workflow response from vertex_builds
         if job.status == JobStatus.COMPLETED:
             # Get the flow
-            flow = await get_flow_by_id_or_endpoint_name(flow_id_str, api_key_user.id)
+            flow = await get_flow_by_id_or_endpoint_name(flow_id_str, current_user.id)
 
             # Reconstruct response from vertex_build table
             return await reconstruct_workflow_response_from_job_id(
                 session=session,
                 flow=flow,
                 job_id=job_id_str,
-                user_id=str(api_key_user.id),
+                user_id=str(current_user.id),
             )
 
         if job.status == JobStatus.FAILED:
@@ -624,7 +624,7 @@ async def get_workflow_status(
 )
 async def stop_workflow(
     request: WorkflowStopRequest,
-    api_key_user: Annotated[UserRead, Depends(api_key_security)],
+    current_user: Annotated[UserRead, Depends(get_current_user_for_workflow)],
 ) -> WorkflowStopResponse:
     """Stop a running workflow execution by job_id.
 
@@ -632,7 +632,7 @@ async def stop_workflow(
 
     Args:
         request: Stop request containing job_id and optional force flag
-        api_key_user: Authenticated user from API key
+        current_user: Authenticated user (session cookie or API key)
 
     Returns:
         WorkflowStopResponse: Confirmation of stop request with final job status
@@ -649,7 +649,7 @@ async def stop_workflow(
 
     try:
         # 1. Fetch Job
-        job = await job_service.get_job_by_job_id(job_id, user_id=api_key_user.id)
+        job = await job_service.get_job_by_job_id(job_id, user_id=current_user.id)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

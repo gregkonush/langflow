@@ -68,6 +68,24 @@ class TestWorkflowDeveloperAPIProtection:
         assert result["detail"]["code"] == "FLOW_NOT_FOUND"
         assert "550e8400-e29b-41d4-a716-446655440000" in result["detail"]["flow_id"]
 
+    async def test_execute_workflow_accepts_session_token_auth(
+        self,
+        client: AsyncClient,
+        logged_in_headers,
+    ):
+        """The endpoint accepts a session token, not only an API key."""
+        request_data = {
+            "flow_id": "550e8400-e29b-41d4-a716-446655440000",
+            "background": False,
+            "stream": False,
+            "inputs": None,
+        }
+        response = await client.post("api/v2/workflows", json=request_data, headers=logged_in_headers)
+
+        # Auth passes via the session token; 404 only because the flow does not exist.
+        assert response.status_code == 404
+        assert response.json()["detail"]["code"] == "FLOW_NOT_FOUND"
+
     async def test_get_workflow_allowed_when_dev_api_enabled_job_not_found(
         self,
         client: AsyncClient,
@@ -201,12 +219,11 @@ class TestWorkflowDeveloperAPIProtection:
         assert result["detail"]["code"] == "JOB_NOT_FOUND"
         assert "This endpoint is not available" not in response.text
 
-    async def test_all_endpoints_require_api_key_authentication(
+    async def test_all_endpoints_require_authentication(
         self,
         client: AsyncClient,
     ):
-        """Test that all workflow endpoints require API key authentication."""
-        # Test POST /workflow without API key
+        """Test that the workflow endpoint rejects an unauthenticated request."""
         request_data = {
             "flow_id": "550e8400-e29b-41d4-a716-446655440000",
             "background": False,
@@ -218,10 +235,8 @@ class TestWorkflowDeveloperAPIProtection:
             "api/v2/workflows",
             json=request_data,
         )
-        # The API returns 403 Forbidden for missing API keys (not 401 Unauthorized)
-        # This is the correct behavior according to the api_key_security implementation
+        # No session cookie and no API key: the combined auth dependency rejects it.
         assert response.status_code == 403
-        assert "API key must be passed" in response.json()["detail"]
 
 
 class TestWorkflowErrorHandling:
@@ -567,7 +582,6 @@ class TestWorkflowErrorHandling:
         # Test GET /workflow without API key
         response = await client.get("api/v2/workflows?job_id=550e8400-e29b-41d4-a716-446655440001")
         assert response.status_code == 403
-        assert "API key must be passed" in response.json()["detail"]
 
 
 class TestWorkflowSyncExecution:
@@ -1005,7 +1019,6 @@ class TestWorkflowSyncExecution:
             json={"job_id": "550e8400-e29b-41d4-a716-446655440001"},
         )
         assert response.status_code == 403
-        assert "API key must be passed" in response.json()["detail"]
 
 
 class TestWorkflowBackgroundQueueing:
