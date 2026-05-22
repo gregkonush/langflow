@@ -4,8 +4,7 @@ This test module provides extensive coverage of the workflow execution endpoints
 including authentication, authorization, error handling, and execution modes.
 
 Test Coverage:
-    - Developer API protection (enabled/disabled scenarios)
-    - API key authentication requirements
+    - Endpoint reachability and authentication
     - Flow validation and error handling
     - Database error handling
     - Execution timeout protection
@@ -14,7 +13,7 @@ Test Coverage:
     - Multiple execution modes (sync, stream, background)
 
 Test Organization:
-    - TestWorkflowDeveloperAPIProtection: Tests developer API feature flag
+    - TestWorkflowDeveloperAPIProtection: Tests endpoint reachability
     - TestWorkflowErrorHandling: Tests comprehensive error scenarios
     - TestWorkflowSyncExecution: Tests successful execution flows
 
@@ -43,81 +42,12 @@ from sqlalchemy.exc import OperationalError
 class TestWorkflowDeveloperAPIProtection:
     """Test developer API protection for workflow endpoints."""
 
-    @pytest.fixture
-    def mock_settings_dev_api_disabled(self):
-        """Mock settings with developer API disabled."""
-        with patch("langflow.api.v2.workflow.get_settings_service") as mock_get_settings_service:
-            mock_service = MagicMock()
-            mock_settings = MagicMock()
-            mock_settings.developer_api_enabled = False
-            mock_service.settings = mock_settings
-            mock_get_settings_service.return_value = mock_service
-            yield mock_settings
-
-    async def test_execute_workflow_blocked_when_dev_api_disabled(
+    async def test_execute_workflow_reachable_at_default_settings_flow_not_found(
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_disabled,  # noqa: ARG002
     ):
-        """Test workflow execution is blocked when developer API is disabled."""
-        request_data = {
-            "flow_id": "550e8400-e29b-41d4-a716-446655440000",
-            "background": False,
-            "stream": False,
-            "inputs": None,
-        }
-
-        headers = {"x-api-key": created_api_key.api_key}
-        response = await client.post(
-            "api/v2/workflows",
-            json=request_data,
-            headers=headers,
-        )
-
-        assert response.status_code == 403
-        result = response.json()
-        assert result["detail"]["code"] == "DEVELOPER_API_DISABLED"
-        assert "Developer API" in result["detail"]["message"]
-
-    async def test_stop_workflow_blocked_when_dev_api_disabled(
-        self,
-        client: AsyncClient,
-        created_api_key,
-        mock_settings_dev_api_disabled,  # noqa: ARG002
-    ):
-        """Test POST workflows/stop endpoint is blocked when developer API is disabled."""
-        request_data = {"job_id": "550e8400-e29b-41d4-a716-446655440001"}
-
-        headers = {"x-api-key": created_api_key.api_key}
-        response = await client.post(
-            "api/v2/workflows/stop",
-            json=request_data,
-            headers=headers,
-        )
-
-        assert response.status_code == 403
-        result = response.json()
-        assert result["detail"]["code"] == "DEVELOPER_API_DISABLED"
-
-    @pytest.fixture
-    def mock_settings_dev_api_enabled(self):
-        """Mock settings with developer API enabled."""
-        with patch("langflow.api.v2.workflow.get_settings_service") as mock_get_settings_service:
-            mock_service = MagicMock()
-            mock_settings = MagicMock()
-            mock_settings.developer_api_enabled = True
-            mock_service.settings = mock_settings
-            mock_get_settings_service.return_value = mock_service
-            yield mock_settings
-
-    async def test_execute_workflow_allowed_when_dev_api_enabled_flow_not_found(
-        self,
-        client: AsyncClient,
-        created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
-    ):
-        """Test POST workflow execution is allowed when developer API is enabled - flow not found."""
+        """The endpoint is reachable with no developer-API gate (default settings)."""
         request_data = {
             "flow_id": "550e8400-e29b-41d4-a716-446655440000",  # Non-existent flow ID
             "background": False,
@@ -132,7 +62,7 @@ class TestWorkflowDeveloperAPIProtection:
             headers=headers,
         )
 
-        # Should return 404 because flow doesn't exist, NOT because endpoint is disabled
+        # Should return 404 because the flow doesn't exist, NOT 403 from a gate.
         assert response.status_code == 404
         result = response.json()
         assert result["detail"]["code"] == "FLOW_NOT_FOUND"
@@ -142,7 +72,6 @@ class TestWorkflowDeveloperAPIProtection:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test GET workflow endpoint is allowed when developer API is enabled - job not found."""
         headers = {"x-api-key": created_api_key.api_key}
@@ -161,7 +90,6 @@ class TestWorkflowDeveloperAPIProtection:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test POST workflow/stop endpoint is allowed when developer API is enabled - job not found."""
         request_data = {
@@ -182,28 +110,10 @@ class TestWorkflowDeveloperAPIProtection:
         assert "550e8400-e29b-41d4-a716-446655440001" in result["detail"]["job_id"]
         assert "This endpoint is not available" not in response.text
 
-    async def test_get_workflow_blocked_when_dev_api_disabled(
-        self,
-        client: AsyncClient,
-        created_api_key,
-        mock_settings_dev_api_disabled,  # noqa: ARG002
-    ):
-        """Test GET workflow endpoint is blocked when developer API is disabled."""
-        headers = {"x-api-key": created_api_key.api_key}
-        response = await client.get(
-            "api/v2/workflows?job_id=550e8400-e29b-41d4-a716-446655440001",
-            headers=headers,
-        )
-
-        assert response.status_code == 403
-        result = response.json()
-        assert result["detail"]["code"] == "DEVELOPER_API_DISABLED"
-
     async def test_execute_workflow_allowed_when_dev_api_enabled_flow_exists(
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test POST /workflow allowed when dev API enabled - flow exists and executes."""
         flow_id = uuid4()
@@ -254,7 +164,6 @@ class TestWorkflowDeveloperAPIProtection:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test GET /workflow allowed when dev API enabled - job exists (501 not implemented)."""
         # Since job management isn't implemented, we'll test with any job_id
@@ -274,7 +183,6 @@ class TestWorkflowDeveloperAPIProtection:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test POST /workflow/stop allowed when dev API enabled - job exists (501 not implemented)."""
         # Since job management isn't implemented, we'll test with any job_id
@@ -296,7 +204,6 @@ class TestWorkflowDeveloperAPIProtection:
     async def test_all_endpoints_require_api_key_authentication(
         self,
         client: AsyncClient,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test that all workflow endpoints require API key authentication."""
         # Test POST /workflow without API key
@@ -320,22 +227,10 @@ class TestWorkflowDeveloperAPIProtection:
 class TestWorkflowErrorHandling:
     """Test comprehensive error handling for workflow endpoints."""
 
-    @pytest.fixture
-    def mock_settings_dev_api_enabled(self):
-        """Mock settings with developer API enabled."""
-        with patch("langflow.api.v2.workflow.get_settings_service") as mock_get_settings_service:
-            mock_service = MagicMock()
-            mock_settings = MagicMock()
-            mock_settings.developer_api_enabled = True
-            mock_service.settings = mock_settings
-            mock_get_settings_service.return_value = mock_service
-            yield mock_settings
-
     async def test_flow_not_found_returns_404_with_error_code(
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test that non-existent flow returns 404 with FLOW_NOT_FOUND error code."""
         flow_id = str(uuid4())
@@ -354,7 +249,6 @@ class TestWorkflowErrorHandling:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test that database errors return 503 with DATABASE_ERROR code."""
         flow_id = str(uuid4())
@@ -377,7 +271,6 @@ class TestWorkflowErrorHandling:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test that flow with no data returns 500 with INVALID_FLOW_DATA code."""
         flow_id = uuid4()
@@ -418,7 +311,6 @@ class TestWorkflowErrorHandling:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test that graph build failure returns 500 with INVALID_FLOW_DATA code."""
         flow_id = uuid4()
@@ -461,7 +353,6 @@ class TestWorkflowErrorHandling:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test that execution timeout works with real async delay."""
         flow_id = uuid4()
@@ -513,7 +404,6 @@ class TestWorkflowErrorHandling:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test that background mode returns 501 with NOT_IMPLEMENTED code."""
         flow_id = uuid4()
@@ -563,7 +453,6 @@ class TestWorkflowErrorHandling:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test that streaming mode returns 501 with NOT_IMPLEMENTED code."""
         flow_id = uuid4()
@@ -608,7 +497,6 @@ class TestWorkflowErrorHandling:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test that all error responses have consistent structure."""
         flow_id = str(uuid4())
@@ -637,7 +525,6 @@ class TestWorkflowErrorHandling:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test that WorkflowValidationError is properly caught and converted to 500."""
         flow_id = uuid4()
@@ -686,22 +573,10 @@ class TestWorkflowErrorHandling:
 class TestWorkflowSyncExecution:
     """Test synchronous workflow execution with realistic component mocking."""
 
-    @pytest.fixture
-    def mock_settings_dev_api_enabled(self):
-        """Mock settings with developer API enabled."""
-        with patch("langflow.api.v2.workflow.get_settings_service") as mock_get_settings_service:
-            mock_service = MagicMock()
-            mock_settings = MagicMock()
-            mock_settings.developer_api_enabled = True
-            mock_service.settings = mock_settings
-            mock_get_settings_service.return_value = mock_service
-            yield mock_settings
-
     async def test_sync_execution_with_empty_flow_returns_200(
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test sync execution with empty flow returns 200 with empty outputs."""
         flow_id = uuid4()
@@ -750,7 +625,6 @@ class TestWorkflowSyncExecution:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test that component execution errors return 200 with error in response body."""
         flow_id = uuid4()
@@ -799,7 +673,6 @@ class TestWorkflowSyncExecution:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test sync execution with ChatInput and ChatOutput components."""
         flow_id = uuid4()
@@ -873,7 +746,6 @@ class TestWorkflowSyncExecution:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test sync execution with LLM component output including model metadata."""
         flow_id = uuid4()
@@ -944,7 +816,6 @@ class TestWorkflowSyncExecution:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test sync execution with SaveToFile component."""
         flow_id = uuid4()
@@ -1009,7 +880,6 @@ class TestWorkflowSyncExecution:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test sync execution with multiple terminal nodes (outputs)."""
         flow_id = uuid4()
@@ -1068,7 +938,6 @@ class TestWorkflowSyncExecution:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test that sync execution response has correct WorkflowExecutionResponse structure."""
         flow_id = uuid4()
@@ -1142,22 +1011,10 @@ class TestWorkflowSyncExecution:
 class TestWorkflowBackgroundQueueing:
     """Test background workflow execution and queueing behavior."""
 
-    @pytest.fixture
-    def mock_settings_dev_api_enabled(self):
-        """Mock settings with developer API enabled."""
-        with patch("langflow.api.v2.workflow.get_settings_service") as mock_get_settings_service:
-            mock_service = MagicMock()
-            mock_settings = MagicMock()
-            mock_settings.developer_api_enabled = True
-            mock_service.settings = mock_settings
-            mock_get_settings_service.return_value = mock_service
-            yield mock_settings
-
     async def test_background_execution_flow(
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test the full background job submission flow."""
         flow_id = uuid4()
@@ -1219,7 +1076,6 @@ class TestWorkflowBackgroundQueueing:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test background execution with a non-existent flow ID."""
         request_data = {
@@ -1237,7 +1093,6 @@ class TestWorkflowBackgroundQueueing:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test handling of exceptions during task queueing."""
         flow_id = uuid4()
@@ -1276,7 +1131,6 @@ class TestWorkflowBackgroundQueueing:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test error handling during synchronous execution."""
         flow_id = uuid4()
@@ -1313,22 +1167,10 @@ class TestWorkflowBackgroundQueueing:
 class TestWorkflowStatus:
     """Test workflow status retrieval endpoints."""
 
-    @pytest.fixture
-    def mock_settings_dev_api_enabled(self):
-        """Mock settings with developer API enabled."""
-        with patch("langflow.api.v2.workflow.get_settings_service") as mock_get_settings_service:
-            mock_service = MagicMock()
-            mock_settings = MagicMock()
-            mock_settings.developer_api_enabled = True
-            mock_service.settings = mock_settings
-            mock_get_settings_service.return_value = mock_service
-            yield mock_settings
-
     async def test_get_status_queued(
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test GET /workflow returns 200 for a queued job."""
         job_id = uuid4()
@@ -1360,7 +1202,6 @@ class TestWorkflowStatus:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test GET /workflow returns 404 for a non-existent job."""
         job_id = uuid4()
@@ -1381,7 +1222,6 @@ class TestWorkflowStatus:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test GET /workflow returns 500 for a failed job."""
         job_id = uuid4()
@@ -1409,7 +1249,6 @@ class TestWorkflowStatus:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test GET /workflow returns reconstructed response for a completed job."""
         job_id = uuid4()
@@ -1449,7 +1288,6 @@ class TestWorkflowStatus:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test GET /workflow returns 408 for a timed out job."""
         job_id = uuid4()
@@ -1481,22 +1319,10 @@ class TestWorkflowStatus:
 class TestWorkflowStop:
     """Test workflow stop endpoints."""
 
-    @pytest.fixture
-    def mock_settings_dev_api_enabled(self):
-        """Mock settings with developer API enabled."""
-        with patch("langflow.api.v2.workflow.get_settings_service") as mock_get_settings_service:
-            mock_service = MagicMock()
-            mock_settings = MagicMock()
-            mock_settings.developer_api_enabled = True
-            mock_service.settings = mock_settings
-            mock_get_settings_service.return_value = mock_service
-            yield mock_settings
-
     async def test_stop_workflow_success(
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test POST /workflow/stop cancels a running job."""
         job_id = str(uuid4())
@@ -1534,7 +1360,6 @@ class TestWorkflowStop:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test POST /workflow/stop returns 404 for non-existent job."""
         job_id = str(uuid4())
@@ -1555,7 +1380,6 @@ class TestWorkflowStop:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """Test POST /workflow/stop handles already cancelled jobs."""
         job_id = str(uuid4())
@@ -1588,23 +1412,12 @@ class TestWorkflowIDORProtection:
     cancellable cross-user unless an ownership check is enforced.
     """
 
-    @pytest.fixture
-    def mock_settings_dev_api_enabled(self):
-        with patch("langflow.api.v2.workflow.get_settings_service") as mock_get_settings:
-            mock_service = MagicMock()
-            mock_settings = MagicMock()
-            mock_settings.developer_api_enabled = True
-            mock_service.settings = mock_settings
-            mock_get_settings.return_value = mock_service
-            yield mock_settings
-
     @pytest.mark.security
     async def test_get_workflow_status_forbidden_for_other_user_job(
         self,
         client: AsyncClient,
         created_api_key,
         created_user_two_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """GET /api/v2/workflows returns 404 when the job belongs to a different user.
 
@@ -1644,7 +1457,6 @@ class TestWorkflowIDORProtection:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """GET /api/v2/workflows returns 200 when the job belongs to the requesting user."""
         job_id = uuid4()
@@ -1680,7 +1492,6 @@ class TestWorkflowIDORProtection:
         client: AsyncClient,
         created_api_key,
         created_user_two_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """POST /api/v2/workflows/stop returns 404 when the job belongs to a different user.
 
@@ -1724,7 +1535,6 @@ class TestWorkflowIDORProtection:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """POST /api/v2/workflows/stop succeeds when the job belongs to the requesting user."""
         job_id = uuid4()
@@ -1761,7 +1571,6 @@ class TestWorkflowIDORProtection:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """GET /api/v2/workflows does NOT block legacy jobs where user_id is NULL.
 
@@ -1798,7 +1607,6 @@ class TestWorkflowIDORProtection:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """POST /api/v2/workflows/stop does NOT block legacy jobs where user_id is NULL.
 
@@ -1840,7 +1648,6 @@ class TestWorkflowIDORProtection:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """POST /api/v2/workflows/stop returns 404 for non-WORKFLOW job types.
 
@@ -1881,7 +1688,6 @@ class TestWorkflowIDORProtection:
         self,
         client: AsyncClient,
         created_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """GET /api/v2/workflows returns 404 for non-WORKFLOW job types.
 
@@ -1919,7 +1725,6 @@ class TestWorkflowIDORProtection:
         client: AsyncClient,
         created_api_key,
         created_user_two_api_key,
-        mock_settings_dev_api_enabled,  # noqa: ARG002
     ):
         """End-to-end: POST /workflows (background=true) stores user_id and blocks cross-user GET.
 

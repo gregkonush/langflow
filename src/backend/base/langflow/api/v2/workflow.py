@@ -9,11 +9,10 @@ Endpoints:
     POST /workflow/stop: Stop a running workflow execution
 
 Features:
-    - Developer API protection (requires developer_api_enabled setting)
     - Comprehensive error handling with structured error responses
     - Timeout protection for long-running executions
     - Support for multiple execution modes (sync, stream, background)
-    - API key authentication required for all endpoints
+    - Session-cookie or API-key authentication
 
 Configuration:
     EXECUTION_TIMEOUT: Maximum execution time for synchronous workflows (300 seconds)
@@ -40,7 +39,7 @@ from lfx.schema.workflow import (
     WorkflowStopRequest,
     WorkflowStopResponse,
 )
-from lfx.services.deps import get_settings_service, injectable_session_scope_readonly
+from lfx.services.deps import injectable_session_scope_readonly
 from pydantic_core import ValidationError as PydanticValidationError
 from sqlalchemy.exc import OperationalError
 
@@ -71,31 +70,7 @@ from langflow.services.deps import get_job_service, get_task_service
 EXECUTION_TIMEOUT = 300  # 5 minutes default timeout for sync execution
 
 
-def check_developer_api_enabled() -> None:
-    """Check if developer API is enabled.
-
-    This dependency function protects all workflow endpoints by verifying that
-    the developer API feature is enabled in the application settings.
-
-    Raises:
-        HTTPException: 403 Forbidden if developer_api_enabled setting is False
-
-    Note:
-        This is used as a router-level dependency to protect all workflow endpoints.
-    """
-    settings = get_settings_service().settings
-    if not settings.developer_api_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "Developer API disabled",
-                "code": "DEVELOPER_API_DISABLED",
-                "message": "Developer API is not enabled. Contact administrator to enable this feature.",
-            },
-        )
-
-
-router = APIRouter(prefix="/workflows", tags=["Workflow"], dependencies=[Depends(check_developer_api_enabled)])
+router = APIRouter(prefix="/workflows", tags=["Workflow"])
 
 
 @router.post(
