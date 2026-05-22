@@ -43,7 +43,6 @@ from langflow.api.v2.converters import (
 from lfx.schema.workflow import (
     ErrorDetail,
     JobStatus,
-    WorkflowExecutionRequest,
     WorkflowExecutionResponse,
     WorkflowJobResponse,
 )
@@ -863,10 +862,10 @@ class TestCreateErrorResponse:
         """Test error response structure."""
         flow_id = "flow-123"
         job_id = uuid4()
-        request = WorkflowExecutionRequest(flow_id=flow_id, inputs={"test": "input"})
+        request_inputs = {"test": "input"}
         error = ValueError("Test error message")
 
-        response = create_error_response(flow_id, str(job_id), request, error)
+        response = create_error_response(flow_id, str(job_id), request_inputs, error)
 
         assert isinstance(response, WorkflowExecutionResponse)
         assert response.flow_id == flow_id
@@ -879,7 +878,7 @@ class TestCreateErrorResponse:
         """Test error details in response."""
         error = RuntimeError("Runtime error occurred")
         job_id = str(uuid4())
-        response = create_error_response("flow-1", job_id, WorkflowExecutionRequest(flow_id="flow-1", inputs={}), error)
+        response = create_error_response("flow-1", job_id, {}, error)
 
         error_detail = response.errors[0]
         assert isinstance(error_detail, ErrorDetail)
@@ -891,10 +890,10 @@ class TestCreateErrorResponse:
     def test_create_error_response_preserves_inputs(self):
         """Test that original inputs are preserved in error response."""
         inputs = {"component.param": "value"}
-        request = WorkflowExecutionRequest(flow_id="flow-1", inputs=inputs)
+        request_inputs = inputs
         error = Exception("Error")
 
-        response = create_error_response("flow-1", str(uuid4()), request, error)
+        response = create_error_response("flow-1", str(uuid4()), request_inputs, error)
         assert response.inputs == inputs
 
 
@@ -928,11 +927,11 @@ class TestRunResponseToWorkflowResponse:
         run_response.outputs = [run_output]
 
         # Create request
-        request = WorkflowExecutionRequest(flow_id="flow-123", inputs={"test": "input"})
+        request_inputs = {"test": "input"}
 
         # Convert
         job_id = uuid4()
-        response = run_response_to_workflow_response(run_response, "flow-123", str(job_id), request, graph)
+        response = run_response_to_workflow_response(run_response, "flow-123", str(job_id), request_inputs, graph)
 
         assert isinstance(response, WorkflowExecutionResponse)
         assert response.flow_id == "flow-123"
@@ -967,10 +966,10 @@ class TestRunResponseToWorkflowResponse:
         run_output.outputs = [result_data]
         run_response.outputs = [run_output]
 
-        request = WorkflowExecutionRequest(flow_id="flow-1", inputs={})
+        request_inputs = {}
 
         job_id = str(uuid4())
-        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request, graph)
+        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request_inputs, graph)
 
         assert "llm-123" in response.outputs
         output = response.outputs["llm-123"]
@@ -1003,10 +1002,10 @@ class TestRunResponseToWorkflowResponse:
         run_response = Mock()
         run_response.outputs = []
 
-        request = WorkflowExecutionRequest(flow_id="flow-1", inputs={})
+        request_inputs = {}
 
         job_id = str(uuid4())
-        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request, graph)
+        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request_inputs, graph)
 
         # Should use IDs instead of duplicate display names
         assert "output-1" in response.outputs
@@ -1040,10 +1039,10 @@ class TestRunResponseToWorkflowResponse:
         run_output.outputs = [result_data]
         run_response.outputs = [run_output]
 
-        request = WorkflowExecutionRequest(flow_id="flow-1", inputs={})
+        request_inputs = {}
 
         job_id = str(uuid4())
-        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request, graph)
+        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request_inputs, graph)
 
         # Data type non-output nodes should show content
         assert response.outputs["data-123"].content == {"result": "42"}
@@ -1067,10 +1066,10 @@ class TestRunResponseToWorkflowResponse:
         run_response = Mock()
         run_response.outputs = []
 
-        request = WorkflowExecutionRequest(flow_id="flow-1", inputs={})
+        request_inputs = {}
 
         job_id = str(uuid4())
-        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request, graph)
+        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request_inputs, graph)
 
         assert "output-123" in response.outputs
 
@@ -1085,10 +1084,10 @@ class TestRunResponseToWorkflowResponse:
         run_response.outputs = []
 
         inputs = {"component.param": "value"}
-        request = WorkflowExecutionRequest(flow_id="flow-1", inputs=inputs)
+        request_inputs = inputs
 
         job_id = str(uuid4())
-        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request, graph)
+        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request_inputs, graph)
         assert response.inputs == inputs
 
     def test_run_response_vector_store_terminal(self):
@@ -1115,10 +1114,10 @@ class TestRunResponseToWorkflowResponse:
         run_output.outputs = [result_data]
         run_response.outputs = [run_output]
 
-        request = WorkflowExecutionRequest(flow_id="flow-1", inputs={})
+        request_inputs = {}
 
         job_id = str(uuid4())
-        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request, graph)
+        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request_inputs, graph)
 
         # Data type non-output nodes should show content
         assert "pinecone-123" in response.outputs
@@ -1151,10 +1150,10 @@ class TestRunResponseToWorkflowResponse:
         run_output.outputs = [result_data]
         run_response.outputs = [run_output]
 
-        request = WorkflowExecutionRequest(flow_id="flow-1", inputs={})
+        request_inputs = {}
 
         job_id = str(uuid4())
-        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request, graph)
+        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request_inputs, graph)
 
         # Should include content and metadata
         assert "retriever-456" in response.outputs
@@ -1176,10 +1175,10 @@ class TestRunResponseToWorkflowResponse:
         run_response = Mock()
         run_response.outputs = None
 
-        request = WorkflowExecutionRequest(flow_id="flow-1", inputs={})
+        request_inputs = {}
 
         job_id = str(uuid4())
-        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request, graph)
+        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request_inputs, graph)
 
         assert response.outputs == {}
         assert response.status == JobStatus.COMPLETED
@@ -1203,11 +1202,11 @@ class TestRunResponseToWorkflowResponse:
         run_response = Mock()
         run_response.outputs = []
 
-        request = WorkflowExecutionRequest(flow_id="flow-1", inputs={})
+        request_inputs = {}
 
         # Should handle gracefully without crashing
         job_id = str(uuid4())
-        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request, graph)
+        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request_inputs, graph)
 
         # Should use ID as fallback when display_name is None
         assert "corrupted-123" in response.outputs
@@ -1238,11 +1237,11 @@ class TestRunResponseToWorkflowResponse:
         run_output.outputs = [result_data]
         run_response.outputs = [run_output]
 
-        request = WorkflowExecutionRequest(flow_id="flow-1", inputs={})
+        request_inputs = {}
 
         # Should handle gracefully - vertex won't match result_data
         job_id = str(uuid4())
-        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request, graph)
+        response = run_response_to_workflow_response(run_response, "flow-1", job_id, request_inputs, graph)
 
         # Output should exist but with no content (no matching result_data)
         assert "output-123" in response.outputs

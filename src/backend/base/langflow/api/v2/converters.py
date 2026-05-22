@@ -32,7 +32,6 @@ from lfx.schema.workflow import (
     ErrorDetail,
     JobId,
     JobStatus,
-    WorkflowExecutionRequest,
     WorkflowExecutionResponse,
     WorkflowJobResponse,
 )
@@ -432,7 +431,7 @@ def run_response_to_workflow_response(
     run_response: RunResponse,
     flow_id: str,
     job_id: str,
-    workflow_request: WorkflowExecutionRequest,
+    inputs: dict[str, Any],
     graph: Graph,
 ) -> WorkflowExecutionResponse:
     """Convert V1 RunResponse to V2 WorkflowExecutionResponse.
@@ -456,7 +455,7 @@ def run_response_to_workflow_response(
         run_response: The V1 response from simple_run_flow containing execution results
         flow_id: The flow identifier
         job_id: The generated job ID for tracking this execution
-        workflow_request: Original workflow request (inputs are echoed back in response)
+        inputs: Request inputs echoed back in the response
         graph: The Graph instance used for terminal node detection and vertex metadata
 
     Returns:
@@ -504,7 +503,7 @@ def run_response_to_workflow_response(
         object="response",
         status=JobStatus.COMPLETED,
         errors=[],
-        inputs=workflow_request.inputs or {},
+        inputs=inputs or {},
         outputs=outputs,
         metadata={},
     )
@@ -532,7 +531,7 @@ def create_job_response(job_id: str, flow_id: str) -> WorkflowJobResponse:
 def create_error_response(
     flow_id: str,
     job_id: JobId,
-    workflow_request: WorkflowExecutionRequest,
+    inputs: dict[str, Any],
     error: Exception,
 ) -> WorkflowExecutionResponse:
     """Create an error response in workflow format.
@@ -540,7 +539,7 @@ def create_error_response(
     Args:
         flow_id: The flow ID
         job_id: The job ID
-        workflow_request: Original request
+        inputs: Request inputs echoed back in the response
         error: The exception that occurred
 
     Returns:
@@ -556,7 +555,7 @@ def create_error_response(
         object="response",
         status=JobStatus.FAILED,
         errors=[error_detail],
-        inputs=workflow_request.inputs or {},
+        inputs=inputs or {},
         outputs={},
         metadata={},
     )

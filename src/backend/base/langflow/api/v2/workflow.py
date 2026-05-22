@@ -25,15 +25,16 @@ from copy import deepcopy
 from typing import Annotated
 from uuid import UUID, uuid4
 
+from ag_ui.core import RunAgentInput
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from lfx.graph.graph.base import Graph
+from lfx.schema.schema import InputValueRequest
 from lfx.schema.workflow import (
     WORKFLOW_EXECUTION_RESPONSES,
     WORKFLOW_STATUS_RESPONSES,
     JobId,
     JobStatus,
-    WorkflowExecutionRequest,
     WorkflowExecutionResponse,
     WorkflowJobResponse,
     WorkflowStopRequest,
@@ -46,8 +47,9 @@ from sqlalchemy.exc import OperationalError
 from langflow.api.utils import extract_global_variables_from_headers
 from langflow.api.v1.schemas import RunResponse
 from langflow.api.v2.converters import (
+    ParsedWorkflowRun,
     create_error_response,
-    parse_flat_inputs,
+    parse_run_agent_input,
     run_response_to_workflow_response,
 )
 from langflow.api.v2.workflow_reconstruction import reconstruct_workflow_response_from_job_id
@@ -73,6 +75,17 @@ EXECUTION_TIMEOUT = 300  # 5 minutes default timeout for sync execution
 router = APIRouter(prefix="/workflows", tags=["Workflow"])
 
 
+def _build_run_inputs(parsed: ParsedWorkflowRun) -> list[InputValueRequest] | None:
+    """Build the graph input list from the AG-UI chat message, if any.
+
+    The last user message becomes a single chat input; an empty message means
+    the flow runs with no chat input (parameters arrive via tweaks instead).
+    """
+    if not parsed.input_value:
+        return None
+    return [InputValueRequest(components=[], input_value=parsed.input_value, type="chat")]
+
+
 @router.post(
     "",
     response_model=None,
@@ -82,78 +95,88 @@ router = APIRouter(prefix="/workflows", tags=["Workflow"])
     description="Execute a workflow with support for sync, stream, and background modes",
 )
 async def execute_workflow(
-    workflow_request: WorkflowExecutionRequest,
+    run_input: RunAgentInput,
     background_tasks: BackgroundTasks,
     http_request: Request,
     current_user: Annotated[UserRead, Depends(get_current_user_for_workflow)],
 ) -> WorkflowExecutionResponse | WorkflowJobResponse | StreamingResponse:
-    """Execute a workflow with support for multiple execution modes.
+    """Execute a workflow from a strict AG-UI ``RunAgentInput`` body.
 
-    **background** and **stream** can't be true at the same time.
-    This endpoint supports three execution modes:
-        - **Synchronous** (background=False, stream=False): Returns complete results immediately
-        - **Streaming** (stream=True): Returns server-sent events in real-time (not yet implemented)
-        - **Background** (background=True): Starts job and returns job ID (not yet implemented)
+    The execution mode is carried in ``forwardedProps.mode``:
+        - **sync**: run inline, return the complete WorkflowExecutionResponse
+        - **background**: queue a job, return a WorkflowJobResponse
+        - **stream** (default): server-sent AG-UI events (not yet implemented)
 
     Error Handling Strategy:
-        - System errors (404, 500, 503, 504): Returned as HTTP error responses
-        - Component execution errors: Returned as HTTP 200 with errors in response body
+        - System errors (404, 500, 503, 504): returned as HTTP error responses
+        - Component execution errors: returned as HTTP 200 with errors in the body
 
     Args:
-        workflow_request: The workflow execution request containing flow_id, inputs, and mode flags
-        background_tasks: FastAPI background tasks for async operations
-        http_request: The HTTP request object for extracting headers
-        current_user: Authenticated user (session cookie or API key)
+        run_input: The AG-UI request body.
+        background_tasks: FastAPI background tasks for async operations.
+        http_request: The HTTP request object for extracting headers.
+        current_user: Authenticated user (session cookie or API key).
 
     Returns:
-        - WorkflowExecutionResponse: For synchronous execution (HTTP 200)
-        - WorkflowJobResponse: For background execution (HTTP 202, not yet implemented)
-        - StreamingResponse: For streaming execution (not yet implemented)
+        - WorkflowExecutionResponse: for synchronous execution (HTTP 200)
+        - WorkflowJobResponse: for background execution
+        - StreamingResponse: for streaming execution
 
     Raises:
         HTTPException:
-            - 403: Developer API disabled
             - 404: Flow not found or user lacks access
-            - 500: Invalid flow data or validation error
-            - 501: Streaming or background mode not yet implemented
+            - 400: Invalid flow data or validation error
+            - 500: Internal server error
+            - 501: Streaming mode not yet implemented
             - 503: Database unavailable
-            - 504: Execution timeout exceeded
+            - 408: Execution timeout exceeded
     """
+    parsed = parse_run_agent_input(run_input)
     job_id = uuid4()
+
+    if not parsed.flow_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "Flow not found",
+                "code": "FLOW_NOT_FOUND",
+                "message": "No flow_id provided in forwardedProps.",
+            },
+        )
 
     try:
         # Validate flow exists and user has permission
-        flow = await get_flow_by_id_or_endpoint_name(workflow_request.flow_id, current_user.id)
+        flow = await get_flow_by_id_or_endpoint_name(parsed.flow_id, current_user.id)
 
         # Background mode execution
-        if workflow_request.background:
+        if parsed.mode == "background":
             return await execute_workflow_background(
-                workflow_request=workflow_request,
+                parsed=parsed,
                 flow=flow,
                 job_id=job_id,
                 current_user=current_user,
                 http_request=http_request,
             )
 
-        # Streaming mode (to be implemented)
-        if workflow_request.stream:
-            raise HTTPException(
-                status_code=status.HTTP_501_NOT_IMPLEMENTED,
-                detail={
-                    "error": "Not implemented",
-                    "code": "NOT_IMPLEMENTED",
-                    "message": "Streaming execution not yet implemented",
-                },
+        # Synchronous execution
+        if parsed.mode == "sync":
+            return await execute_sync_workflow_with_timeout(
+                parsed=parsed,
+                flow=flow,
+                job_id=job_id,
+                current_user=current_user,
+                background_tasks=background_tasks,
+                http_request=http_request,
             )
 
-        # Synchronous execution (default)
-        return await execute_sync_workflow_with_timeout(
-            workflow_request=workflow_request,
-            flow=flow,
-            job_id=job_id,
-            current_user=current_user,
-            background_tasks=background_tasks,
-            http_request=http_request,
+        # Streaming mode (default) - implemented in a later task
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={
+                "error": "Not implemented",
+                "code": "NOT_IMPLEMENTED",
+                "message": "Streaming execution not yet implemented",
+            },
         )
 
     except HTTPException as e:
@@ -164,8 +187,8 @@ async def execute_workflow(
                 detail={
                     "error": "Flow not found",
                     "code": "FLOW_NOT_FOUND",
-                    "message": f"Flow '{workflow_request.flow_id}' does not exist. Verify the flow_id and try again.",
-                    "flow_id": workflow_request.flow_id,
+                    "message": f"Flow '{parsed.flow_id}' does not exist. Verify the flow_id and try again.",
+                    "flow_id": parsed.flow_id,
                 },
             ) from e
         raise
@@ -176,7 +199,7 @@ async def execute_workflow(
                 "error": "Service unavailable, Please try again.",
                 "code": "DATABASE_ERROR",
                 "message": f"Failed to fetch flow: {e!s}",
-                "flow_id": workflow_request.flow_id,
+                "flow_id": parsed.flow_id,
             },
         ) from e
     except WorkflowTimeoutError:
@@ -187,7 +210,7 @@ async def execute_workflow(
                 "code": "EXECUTION_TIMEOUT",
                 "message": f"Workflow execution exceeded {EXECUTION_TIMEOUT} seconds",
                 "job_id": str(job_id),
-                "flow_id": str(workflow_request.flow_id),
+                "flow_id": str(parsed.flow_id),
                 "timeout_seconds": EXECUTION_TIMEOUT,
             },
         ) from None
@@ -198,7 +221,7 @@ async def execute_workflow(
                 "error": "Workflow validation error",
                 "code": "INVALID_FLOW_DATA",
                 "message": str(e),
-                "flow_id": workflow_request.flow_id,
+                "flow_id": parsed.flow_id,
             },
         ) from e
     except WorkflowServiceUnavailableError as err:
@@ -208,7 +231,7 @@ async def execute_workflow(
                 "error": "Service unavailable",
                 "code": "QUEUE_SERVICE_UNAVAILABLE",
                 "message": str(err),
-                "flow_id": workflow_request.flow_id,
+                "flow_id": parsed.flow_id,
             },
         ) from err
     except (WorkflowResourceError, WorkflowQueueFullError, MemoryError) as err:
@@ -218,7 +241,7 @@ async def execute_workflow(
                 "error": "Service busy",
                 "code": "SERVICE_BUSY",
                 "message": "The service is currently unable to handle the request due to resource limits.",
-                "flow_id": workflow_request.flow_id,
+                "flow_id": parsed.flow_id,
             },
         ) from err
     except Exception as err:
@@ -228,13 +251,13 @@ async def execute_workflow(
                 "error": "Internal server error",
                 "code": "INTERNAL_SERVER_ERROR",
                 "message": f"An unexpected error occurred: {err!s}",
-                "flow_id": workflow_request.flow_id,
+                "flow_id": parsed.flow_id,
             },
         ) from err
 
 
 async def execute_sync_workflow_with_timeout(
-    workflow_request: WorkflowExecutionRequest,
+    parsed: ParsedWorkflowRun,
     flow: FlowRead,
     job_id: UUID,
     current_user: UserRead,
@@ -244,7 +267,7 @@ async def execute_sync_workflow_with_timeout(
     """Execute workflow with timeout protection.
 
     Args:
-        workflow_request: The workflow execution request
+        parsed: The parsed AG-UI run parameters
         flow: The flow to execute
         job_id: Generated job ID for tracking
         current_user: Authenticated user
@@ -261,7 +284,7 @@ async def execute_sync_workflow_with_timeout(
     try:
         return await asyncio.wait_for(
             execute_sync_workflow(
-                workflow_request=workflow_request,
+                parsed=parsed,
                 flow=flow,
                 job_id=job_id,
                 current_user=current_user,
@@ -275,7 +298,7 @@ async def execute_sync_workflow_with_timeout(
 
 
 async def execute_sync_workflow(
-    workflow_request: WorkflowExecutionRequest,
+    parsed: ParsedWorkflowRun,
     flow: FlowRead,
     job_id: UUID,
     current_user: UserRead,
@@ -292,7 +315,7 @@ async def execute_sync_workflow(
     components fail, which is useful for debugging and incremental processing.
 
     Execution Flow:
-        1. Parse flat inputs into tweaks and session_id
+        1. Apply tweaks and chat input from the parsed AG-UI request
         2. Validate flow data exists
         3. Extract context from HTTP headers
         4. Build graph from flow data with tweaks applied
@@ -301,7 +324,7 @@ async def execute_sync_workflow(
         7. Convert V1 RunResponse to V2 WorkflowExecutionResponse
 
     Args:
-        workflow_request: The workflow execution request with inputs and configuration
+        parsed: The parsed AG-UI run parameters with tweaks and chat input
         flow: The flow model from database
         job_id: Generated job ID for tracking this execution
         current_user: Authenticated user for permission checks
@@ -314,8 +337,9 @@ async def execute_sync_workflow(
     Raises:
         WorkflowValidationError: If flow data is None or graph build fails
     """
-    # Parse flat inputs structure
-    tweaks, session_id = parse_flat_inputs(workflow_request.inputs or {})
+    # Tweaks and chat input come straight from the parsed AG-UI request
+    tweaks = parsed.tweaks
+    session_id = parsed.session_id
 
     # Validate flow data - this is a system error, not execution error
     if flow.data is None:
@@ -361,7 +385,7 @@ async def execute_sync_workflow(
             graph=graph,
             flow_id=flow_id_str,
             session_id=session_id,
-            inputs=None,
+            inputs=_build_run_inputs(parsed),
             outputs=terminal_node_ids,
             stream=False,
         )
@@ -371,9 +395,9 @@ async def execute_sync_workflow(
         # Convert to WorkflowExecutionResponse
         return run_response_to_workflow_response(
             run_response=run_response,
-            flow_id=workflow_request.flow_id,
+            flow_id=parsed.flow_id,
             job_id=str(job_id),
-            workflow_request=workflow_request,
+            inputs=parsed.tweaks,
             graph=graph,
         )
 
@@ -389,15 +413,15 @@ async def execute_sync_workflow(
         # Component execution errors - return in response body with HTTP 200
         # This allows partial results and detailed error information per component
         return create_error_response(
-            flow_id=workflow_request.flow_id,
+            flow_id=parsed.flow_id,
             job_id=job_id,
-            workflow_request=workflow_request,
+            inputs=parsed.tweaks,
             error=exc,
         )
 
 
 async def execute_workflow_background(
-    workflow_request: WorkflowExecutionRequest,
+    parsed: ParsedWorkflowRun,
     flow: FlowRead,
     job_id: JobId,
     current_user: UserRead,
@@ -405,8 +429,9 @@ async def execute_workflow_background(
 ) -> WorkflowJobResponse:
     """Execute workflow in the background and return job ID for the user to track the execution status."""
     try:
-        # Parse flat inputs structure
-        tweaks, session_id = parse_flat_inputs(workflow_request.inputs or {})
+        # Tweaks and chat input come straight from the parsed AG-UI request
+        tweaks = parsed.tweaks
+        session_id = parsed.session_id
 
         # Validate flow data
         if flow.data is None:
@@ -452,12 +477,12 @@ async def execute_workflow_background(
             graph=graph,
             flow_id=flow_id_str,
             session_id=session_id,
-            inputs=None,
+            inputs=_build_run_inputs(parsed),
             outputs=terminal_node_ids,
             stream=False,
         )
         status = JobStatus.QUEUED
-        return WorkflowJobResponse(job_id=str(job_id), flow_id=workflow_request.flow_id, status=status)
+        return WorkflowJobResponse(job_id=str(job_id), flow_id=parsed.flow_id, status=status)
 
     except (WorkflowResourceError, WorkflowServiceUnavailableError, WorkflowQueueFullError):
         # Re-raise infrastructure/resource errors to be handled by the endpoint
