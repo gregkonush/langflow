@@ -426,107 +426,19 @@ async def execute_sync_workflow(
         )
 
 
-async def execute_workflow_background(
-    parsed: ParsedWorkflowRun,
-    flow: FlowRead,
-    job_id: JobId,
-    current_user: UserRead,
-    http_request: Request,
-) -> WorkflowJobResponse:
-    """Execute workflow in the background and return job ID for the user to track the execution status."""
-    try:
-        # Tweaks and chat input come straight from the parsed AG-UI request
-        tweaks = parsed.tweaks
-        session_id = parsed.session_id
-
-        # Validate flow data
-        if flow.data is None:
-            msg = f"Flow {flow.id} has no data"
-            raise ValueError(msg)
-
-        # Extract request-level variables from headers (similar to V1)
-        # Headers with prefix X-LANGFLOW-GLOBAL-VAR-* are extracted and made available to components
-        request_variables = extract_global_variables_from_headers(http_request.headers)
-
-        # Build context from request variables (similar to V1's _run_flow_internal)
-        context = {"request_variables": request_variables} if request_variables else None
-
-        # Build the graph once
-        flow_id_str = str(flow.id)
-        user_id = str(current_user.id)
-        graph_data = deepcopy(flow.data)
-        graph_data = process_tweaks(graph_data, tweaks, stream=False)
-        graph = Graph.from_payload(
-            graph_data, flow_id=flow_id_str, user_id=user_id, flow_name=flow.name, context=context
-        )
-        graph.set_run_id(job_id)
-
-        # Get terminal nodes
-        terminal_node_ids = graph.get_terminal_nodes()
-
-        # Launch background task
-        task_service = get_task_service()
-        job_service = get_job_service()
-
-        # Create job synchronously to ensure it exists before background task starts
-        # and so we can return a valid job status immediately
-        await job_service.create_job(
-            job_id=job_id,
-            flow_id=flow_id_str,
-            user_id=current_user.id,
-        )
-
-        await task_service.fire_and_forget_task(
-            job_service.execute_with_status,
-            job_id=job_id,
-            run_coro_func=run_graph_internal,
-            graph=graph,
-            flow_id=flow_id_str,
-            session_id=session_id,
-            inputs=_build_run_inputs(parsed),
-            outputs=terminal_node_ids,
-            stream=False,
-        )
-        status = JobStatus.QUEUED
-        return WorkflowJobResponse(job_id=str(job_id), flow_id=parsed.flow_id, status=status)
-
-    except (WorkflowResourceError, WorkflowServiceUnavailableError, WorkflowQueueFullError):
-        # Re-raise infrastructure/resource errors to be handled by the endpoint
-        raise
-    except ValueError as exc:
-        raise WorkflowValidationError(str(exc)) from exc
-    except MemoryError as exc:
-        raise WorkflowResourceError from exc
-
-
-def _execute_streaming_workflow(
+def _build_run_graph(
     *,
     parsed: ParsedWorkflowRun,
     flow: FlowRead,
-    job_id: UUID,
     current_user: UserRead,
     http_request: Request,
-) -> EventSourceResponse:
-    """Run a workflow and stream AG-UI events over server-sent events.
+    job_id: UUID | JobId,
+) -> Graph:
+    """Build a graph for a streamed or background AG-UI run.
 
-    The graph is built synchronously so build failures surface as HTTP errors.
-    The run itself happens in a background task that feeds a Langflow
-    ``EventManager`` queue; the response generator drains that queue, translates
-    each event to AG-UI, and yields it as a server-sent event. A failure during
-    the run becomes a ``RUN_ERROR`` event, not an HTTP error.
-
-    Args:
-        parsed: The parsed AG-UI run parameters.
-        flow: The flow to execute.
-        job_id: Generated job ID, used as the graph run id and translator fallback.
-        current_user: Authenticated user.
-        http_request: The HTTP request object for extracting headers.
-
-    Returns:
-        An ``EventSourceResponse`` streaming AG-UI events.
-
-    Raises:
-        WorkflowValidationError: If flow data is missing or the graph fails to build.
+    Raises ``WorkflowValidationError`` if the flow has no data or the graph
+    cannot be constructed, so the endpoint can surface the failure as HTTP 400
+    before any streaming starts.
     """
     if flow.data is None:
         msg = f"Flow {flow.id} has no data. The flow may be corrupted."
@@ -536,30 +448,51 @@ def _execute_streaming_workflow(
     context = {"request_variables": request_variables} if request_variables else None
 
     try:
-        flow_id_str = str(flow.id)
         graph_data = deepcopy(flow.data)
         graph_data = process_tweaks(graph_data, parsed.tweaks, stream=False)
         graph = Graph.from_payload(
-            graph_data, flow_id=flow_id_str, user_id=str(current_user.id), flow_name=flow.name, context=context
+            graph_data,
+            flow_id=str(flow.id),
+            user_id=str(current_user.id),
+            flow_name=flow.name,
+            context=context,
         )
         graph.set_run_id(job_id)
+    except WorkflowValidationError:
+        raise
     except Exception as e:
         msg = f"Failed to build graph from flow data: {e!s}"
         raise WorkflowValidationError(msg) from e
+    return graph
 
+
+async def _agui_event_frames(
+    graph: Graph,
+    *,
+    flow_id: str,
+    run_id: str,
+    thread_id: str,
+    session_id: str | None,
+    inputs: list[InputValueRequest] | None,
+) -> AsyncIterator[bytes]:
+    """Run the graph, translate its events to AG-UI, yield SSE frames.
+
+    Each frame carries a monotonic ``id:`` so clients can resume via
+    ``Last-Event-ID``. A failure during the run becomes a ``RUN_ERROR`` event
+    rather than an exception. Closing the consumer cancels the graph run.
+    """
     terminal_node_ids = graph.get_terminal_nodes()
     queue: asyncio.Queue = asyncio.Queue()
     event_manager = create_default_event_manager(queue)
-    translator = AGUITranslator(run_id=parsed.run_id or str(job_id), thread_id=parsed.session_id or flow_id_str)
+    translator = AGUITranslator(run_id=run_id, thread_id=thread_id)
 
-    async def drive_graph_run() -> None:
-        """Run the graph, then signal end-of-stream on the queue."""
+    async def drive() -> None:
         try:
             await run_graph_internal(
                 graph=graph,
-                flow_id=flow_id_str,
-                session_id=parsed.session_id,
-                inputs=_build_run_inputs(parsed),
+                flow_id=flow_id,
+                session_id=session_id,
+                inputs=inputs,
                 outputs=terminal_node_ids,
                 stream=True,
                 event_manager=event_manager,
@@ -573,38 +506,197 @@ def _execute_streaming_workflow(
         await queue.put((None, None, time.time()))
 
     def _frame(ag_event: object, seq: int) -> bytes:
-        """Encode one AG-UI event as an SSE frame (pre-serialized camelCase JSON)."""
         return format_sse_event(
             data_str=ag_event.model_dump_json(by_alias=True, exclude_none=True),
             id=str(seq),
         )
 
-    async def event_stream() -> AsyncIterator[bytes]:
-        """Drain the event queue, translate to AG-UI, yield SSE frames."""
-        seq = 0
-        run_task = asyncio.create_task(drive_graph_run())
-        try:
-            for ag_event in translator.start():
+    seq = 0
+    run_task = asyncio.create_task(drive())
+    try:
+        for ag_event in translator.start():
+            yield _frame(ag_event, seq)
+            seq += 1
+        while True:
+            _, value, _ = await queue.get()
+            if value is None:
+                break
+            payload = json.loads(value.decode("utf-8"))
+            for ag_event in translator.translate(payload.get("event", ""), payload.get("data") or {}):
                 yield _frame(ag_event, seq)
                 seq += 1
-            while True:
-                _, value, _ = await queue.get()
-                if value is None:
-                    break
-                payload = json.loads(value.decode("utf-8"))
-                for ag_event in translator.translate(payload.get("event", ""), payload.get("data") or {}):
-                    yield _frame(ag_event, seq)
-                    seq += 1
-        finally:
-            if not run_task.done():
-                run_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await run_task
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
 
+
+def _execute_streaming_workflow(
+    *,
+    parsed: ParsedWorkflowRun,
+    flow: FlowRead,
+    job_id: UUID,
+    current_user: UserRead,
+    http_request: Request,
+) -> EventSourceResponse:
+    """Run a workflow live and stream AG-UI events over server-sent events.
+
+    The graph is built synchronously so build failures surface as HTTP errors;
+    the run itself is driven by an async generator that yields AG-UI SSE frames
+    as the graph emits events. A failure during the run becomes a ``RUN_ERROR``
+    event rather than an HTTP error.
+    """
+    graph = _build_run_graph(
+        parsed=parsed,
+        flow=flow,
+        current_user=current_user,
+        http_request=http_request,
+        job_id=job_id,
+    )
     return EventSourceResponse(
-        event_stream(),
+        _agui_event_frames(
+            graph,
+            flow_id=str(flow.id),
+            run_id=parsed.run_id or str(job_id),
+            thread_id=parsed.session_id or str(flow.id),
+            session_id=parsed.session_id,
+            inputs=_build_run_inputs(parsed),
+        ),
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+class _BackgroundRun:
+    """In-memory buffer of a background run's AG-UI SSE frames for re-attach.
+
+    The buffer lives in the process; restarts drop it. Multiple readers can
+    re-attach concurrently and tail until the run ends.
+    """
+
+    def __init__(self, user_id: str) -> None:
+        self.user_id = user_id
+        self.frames: list[bytes] = []
+        self.done = False
+        self._cond = asyncio.Condition()
+
+    async def append(self, frame: bytes) -> None:
+        async with self._cond:
+            self.frames.append(frame)
+            self._cond.notify_all()
+
+    async def finish(self) -> None:
+        async with self._cond:
+            self.done = True
+            self._cond.notify_all()
+
+    async def replay(self, start_index: int) -> AsyncIterator[bytes]:
+        """Yield buffered frames from ``start_index`` and tail until done."""
+        idx = max(start_index, 0)
+        while True:
+            async with self._cond:
+                while idx >= len(self.frames) and not self.done:
+                    await self._cond.wait()
+                snapshot = self.frames[idx:]
+                finished = self.done
+            for frame in snapshot:
+                yield frame
+            idx += len(snapshot)
+            if finished and idx >= len(self.frames):
+                return
+
+
+# Process-local registry of background runs keyed by job_id, bounded by
+# ``_MAX_BACKGROUND_RUNS`` (oldest evicted first). Re-attach reads this.
+_MAX_BACKGROUND_RUNS = 100
+_BACKGROUND_RUNS: dict[str, _BackgroundRun] = {}
+
+
+def _register_background_run(job_id: str, bg_run: _BackgroundRun) -> None:
+    """Register a background run, evicting the oldest entry when full."""
+    if len(_BACKGROUND_RUNS) >= _MAX_BACKGROUND_RUNS:
+        oldest = next(iter(_BACKGROUND_RUNS))
+        _BACKGROUND_RUNS.pop(oldest, None)
+    _BACKGROUND_RUNS[job_id] = bg_run
+
+
+async def _buffer_background_run(
+    *,
+    bg_run: _BackgroundRun,
+    graph: Graph,
+    job_id: str,
+    parsed: ParsedWorkflowRun,
+) -> None:
+    """Run a background graph, buffer its AG-UI frames, and finalize job status."""
+    errored = False
+    try:
+        async for frame in _agui_event_frames(
+            graph,
+            flow_id=str(graph.flow_id),
+            run_id=parsed.run_id or job_id,
+            thread_id=parsed.session_id or str(graph.flow_id),
+            session_id=parsed.session_id,
+            inputs=_build_run_inputs(parsed),
+        ):
+            if b'"RUN_ERROR"' in frame:
+                errored = True
+            await bg_run.append(frame)
+    finally:
+        await bg_run.finish()
+        with contextlib.suppress(Exception):
+            await get_job_service().update_job_status(
+                job_id,
+                JobStatus.FAILED if errored else JobStatus.COMPLETED,
+            )
+
+
+async def execute_workflow_background(
+    parsed: ParsedWorkflowRun,
+    flow: FlowRead,
+    job_id: JobId,
+    current_user: UserRead,
+    http_request: Request,
+) -> WorkflowJobResponse:
+    """Run a workflow in the background, buffering AG-UI events for re-attach.
+
+    A job row is created so ``GET /workflows`` and ``POST /workflows/stop`` keep
+    working. The run is fired through the task service with ``graph`` as a
+    kwarg so the task id matches ``job_id`` and ``/stop`` can revoke it.
+    """
+    try:
+        graph = _build_run_graph(
+            parsed=parsed,
+            flow=flow,
+            current_user=current_user,
+            http_request=http_request,
+            job_id=job_id,
+        )
+        flow_id_str = str(flow.id)
+
+        await get_job_service().create_job(
+            job_id=job_id,
+            flow_id=flow_id_str,
+            user_id=current_user.id,
+        )
+
+        bg_run = _BackgroundRun(user_id=str(current_user.id))
+        _register_background_run(str(job_id), bg_run)
+
+        await get_task_service().fire_and_forget_task(
+            _buffer_background_run,
+            bg_run=bg_run,
+            graph=graph,
+            job_id=str(job_id),
+            parsed=parsed,
+        )
+        return WorkflowJobResponse(job_id=str(job_id), flow_id=parsed.flow_id, status=JobStatus.QUEUED)
+
+    except (WorkflowResourceError, WorkflowServiceUnavailableError, WorkflowQueueFullError):
+        raise
+    except WorkflowValidationError:
+        raise
+    except MemoryError as exc:
+        raise WorkflowResourceError from exc
 
 
 @router.get(
@@ -853,3 +945,45 @@ async def stop_workflow(
                 "message": f"Failed to stop job: {job_id} - {exc!s}",
             },
         ) from exc
+
+
+@router.get(
+    "/{job_id}/events",
+    response_model=None,
+    summary="Re-attach to a background run",
+    description="Replay buffered AG-UI events for a background run and tail until it ends.",
+)
+async def reattach_workflow_events(
+    job_id: str,
+    http_request: Request,
+    current_user: Annotated[UserRead, Depends(get_current_user_for_workflow)],
+) -> EventSourceResponse:
+    """Stream the AG-UI events of a background run, replaying from ``Last-Event-ID``.
+
+    The buffer is process-local. Cross-user access is rejected with 404 to avoid
+    leaking the existence of other users' runs.
+    """
+    bg_run = _BACKGROUND_RUNS.get(job_id)
+    if bg_run is None or bg_run.user_id != str(current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "Background run not found",
+                "code": "JOB_NOT_FOUND",
+                "message": f"No buffered AG-UI events for job {job_id}.",
+                "job_id": job_id,
+            },
+        )
+
+    last_event_id = http_request.headers.get("Last-Event-ID")
+    start_index = 0
+    if last_event_id:
+        try:
+            start_index = int(last_event_id) + 1
+        except ValueError:
+            start_index = 0
+
+    return EventSourceResponse(
+        bg_run.replay(start_index),
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

@@ -379,3 +379,92 @@ class TestAGUICancellation:
 
         # The stream delivered at least one event before the client disconnected.
         assert seen
+
+
+class TestAGUIBackgroundReattach:
+    """A background run buffers its AG-UI events so a client can re-attach."""
+
+    async def test_background_run_events_can_be_reattached(
+        self,
+        client: AsyncClient,
+        created_api_key,
+        chatbot_flow,
+    ):
+        """After starting a background run, GET /workflows/{job_id}/events replays its stream."""
+        headers = {"x-api-key": created_api_key.api_key}
+        start = await client.post(
+            "api/v2/workflows",
+            json=_agui_body(chatbot_flow, mode="background"),
+            headers=headers,
+        )
+        assert start.status_code == 200
+        job_id = start.json()["job_id"]
+
+        response = await client.get(f"api/v2/workflows/{job_id}/events", headers=headers)
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        body = response.text
+        assert "RUN_STARTED" in body
+        assert "RUN_FINISHED" in body
+
+    async def test_reattach_replays_after_last_event_id(
+        self,
+        client: AsyncClient,
+        created_api_key,
+        chatbot_flow,
+    ):
+        """Re-attaching with a Last-Event-ID header skips already-delivered events."""
+        headers = {"x-api-key": created_api_key.api_key}
+        start = await client.post(
+            "api/v2/workflows",
+            json=_agui_body(chatbot_flow, mode="background"),
+            headers=headers,
+        )
+        job_id = start.json()["job_id"]
+
+        response = await client.get(
+            f"api/v2/workflows/{job_id}/events",
+            headers={**headers, "Last-Event-ID": "0"},
+        )
+
+        assert response.status_code == 200
+        body = response.text
+        # Event 0 is RUN_STARTED; with Last-Event-ID=0 it must not be replayed.
+        assert "id: 0\n" not in body
+        assert "RUN_FINISHED" in body
+
+    async def test_reattach_unknown_job_returns_404(
+        self,
+        client: AsyncClient,
+        created_api_key,
+    ):
+        """Re-attaching to a job id with no background run returns 404."""
+        response = await client.get(
+            "api/v2/workflows/550e8400-e29b-41d4-a716-446655440000/events",
+            headers={"x-api-key": created_api_key.api_key},
+        )
+
+        assert response.status_code == 404
+
+    async def test_reattach_forbidden_for_other_user(
+        self,
+        client: AsyncClient,
+        created_api_key,
+        created_user_two_api_key,
+        chatbot_flow,
+    ):
+        """A background run's event stream is not readable by another user."""
+        start = await client.post(
+            "api/v2/workflows",
+            json=_agui_body(chatbot_flow, mode="background"),
+            headers={"x-api-key": created_api_key.api_key},
+        )
+        job_id = start.json()["job_id"]
+
+        response = await client.get(
+            f"api/v2/workflows/{job_id}/events",
+            headers={"x-api-key": created_user_two_api_key.api_key},
+        )
+
+        assert response.status_code == 404
