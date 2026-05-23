@@ -936,6 +936,7 @@ const useFlowStore = create<FlowStoreType>((set, get) => ({
         startComponentId: startNodeId,
         stopComponentId: stopNodeId,
         flowData: { nodes: get().nodes, edges: get().edges },
+        files,
       });
       return;
     }

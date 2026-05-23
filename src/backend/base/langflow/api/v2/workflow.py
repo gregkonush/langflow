@@ -478,7 +478,7 @@ async def _agui_event_frames(
                 event_manager=event_manager,
                 inputs=input_request,
                 data=flow_data,
-                files=None,
+                files=parsed.files,
                 stop_component_id=parsed.stop_component_id,
                 start_component_id=parsed.start_component_id,
                 log_builds=False,

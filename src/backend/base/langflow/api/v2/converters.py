@@ -57,6 +57,8 @@ class ParsedWorkflowRun:
     # Optional live flow data (nodes + edges) overriding the DB copy. Lets the
     # canvas run with unsaved tweaks the user has made but not yet persisted.
     data: dict[str, Any] | None = None
+    # Optional runtime file references the graph build needs.
+    files: list[str] | None = None
 
 
 def parse_run_agent_input(run_input: RunAgentInput) -> ParsedWorkflowRun:
@@ -80,6 +82,8 @@ def parse_run_agent_input(run_input: RunAgentInput) -> ParsedWorkflowRun:
             break
 
     data = forwarded.get("data") if isinstance(forwarded.get("data"), dict) else None
+    files_value = forwarded.get("files")
+    files = list(files_value) if isinstance(files_value, list) and files_value else None
     return ParsedWorkflowRun(
         flow_id=forwarded.get("flow_id"),
         tweaks=forwarded.get("tweaks") or {},
@@ -90,6 +94,7 @@ def parse_run_agent_input(run_input: RunAgentInput) -> ParsedWorkflowRun:
         start_component_id=forwarded.get("start_component_id"),
         stop_component_id=forwarded.get("stop_component_id"),
         data=data,
+        files=files,
     )
 
 
