@@ -29,7 +29,7 @@ from copy import deepcopy
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from ag_ui.core import RunAgentInput
+from ag_ui.core import CustomEvent, RunAgentInput
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import EventSourceResponse, StreamingResponse
 from fastapi.sse import format_sse_event
@@ -499,6 +499,10 @@ async def _agui_event_frames(
             id=str(seq),
         )
 
+    # Event types where the original Langflow payload needs to ride
+    # alongside the AG-UI translation (chat-view consumes the v1 shape).
+    side_channel_events = frozenset({"add_message", "token", "remove_message", "error"})
+
     seq = 0
     run_task = asyncio.create_task(drive())
     try:
@@ -510,7 +514,15 @@ async def _agui_event_frames(
             if value is None:
                 break
             payload = json.loads(value.decode("utf-8"))
-            for ag_event in translator.translate(payload.get("event", ""), payload.get("data") or {}):
+            event_type = payload.get("event", "")
+            event_data = payload.get("data") or {}
+            if event_type in side_channel_events:
+                yield _frame(
+                    CustomEvent(name="langflow.event", value={"event_type": event_type, "data": event_data}),
+                    seq,
+                )
+                seq += 1
+            for ag_event in translator.translate(event_type, event_data):
                 yield _frame(ag_event, seq)
                 seq += 1
     finally:

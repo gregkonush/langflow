@@ -9,6 +9,7 @@
  */
 
 import { type BaseEvent, EventType } from "@ag-ui/client";
+import { handleMessageEvent } from "@/components/core/playgroundComponent/chat-view/utils/message-event-handler";
 import { BuildStatus } from "@/constants/enums";
 import useAlertStore from "@/stores/alertStore";
 import useFlowStore from "@/stores/flowStore";
@@ -108,6 +109,18 @@ export async function runFlowAGUI(opts: WorkflowRunOptions): Promise<void> {
           const ops =
             (event as unknown as { delta?: JsonPatchOp[] }).delta ?? [];
           applyStateDelta(ops, input.runId, touchedNodeIds);
+        } else if (event.type === EventType.CUSTOM) {
+          // Side-channel: the backend mirrors message-shaped events (add_message,
+          // token, remove_message, error) as a `langflow.event` CustomEvent so
+          // the playground's chat-view utilities can consume them in their v1
+          // shape until Phase 5 can rewrite chat-view onto AG-UI events directly.
+          const custom = event as unknown as {
+            name?: string;
+            value?: { event_type?: string; data?: unknown };
+          };
+          if (custom.name === "langflow.event" && custom.value?.event_type) {
+            handleMessageEvent(custom.value.event_type, custom.value.data);
+          }
         } else if (event.type === EventType.RUN_FINISHED) {
           flowStore.setBuildInfo({ success: true });
         } else if (event.type === EventType.RUN_ERROR) {
