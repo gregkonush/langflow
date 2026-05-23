@@ -50,6 +50,7 @@ from lfx.services.deps import injectable_session_scope_readonly
 from pydantic_core import ValidationError as PydanticValidationError
 from sqlalchemy.exc import OperationalError
 
+from langflow.api.build import generate_flow_events
 from langflow.api.utils import extract_global_variables_from_headers
 from langflow.api.v1.schemas import RunResponse
 from langflow.api.v2.agui_translator import AGUITranslator
@@ -73,7 +74,7 @@ from langflow.services.auth.utils import get_current_user_for_workflow
 from langflow.services.database.models.flow.model import FlowRead
 from langflow.services.database.models.jobs.model import JobType
 from langflow.services.database.models.user.model import UserRead
-from langflow.services.deps import get_job_service, get_task_service
+from langflow.services.deps import get_job_service, get_queue_service, get_task_service
 
 # Configuration constants
 EXECUTION_TIMEOUT = 300  # 5 minutes default timeout for sync execution
@@ -182,7 +183,7 @@ async def execute_workflow(
             flow=flow,
             job_id=job_id,
             current_user=current_user,
-            http_request=http_request,
+            background_tasks=background_tasks,
         )
 
     except HTTPException as e:
@@ -426,84 +427,70 @@ async def execute_sync_workflow(
         )
 
 
-def _build_run_graph(
-    *,
-    parsed: ParsedWorkflowRun,
-    flow: FlowRead,
-    current_user: UserRead,
-    http_request: Request,
-    job_id: UUID | JobId,
-) -> Graph:
-    """Build a graph for a streamed or background AG-UI run.
+def _single_input_value_request(parsed: ParsedWorkflowRun) -> InputValueRequest | None:
+    """Build the single chat InputValueRequest the v1 build loop accepts, if any.
 
-    Raises ``WorkflowValidationError`` if the flow has no data or the graph
-    cannot be constructed, so the endpoint can surface the failure as HTTP 400
-    before any streaming starts.
+    The v1 build path (``generate_flow_events``) takes a single
+    ``InputValueRequest`` rather than a list; an empty chat message means no
+    input is dispatched and parameters arrive via tweaks only.
     """
-    if flow.data is None:
-        msg = f"Flow {flow.id} has no data. The flow may be corrupted."
-        raise WorkflowValidationError(msg)
-
-    request_variables = extract_global_variables_from_headers(http_request.headers)
-    context = {"request_variables": request_variables} if request_variables else None
-
-    try:
-        graph_data = deepcopy(flow.data)
-        graph_data = process_tweaks(graph_data, parsed.tweaks, stream=False)
-        graph = Graph.from_payload(
-            graph_data,
-            flow_id=str(flow.id),
-            user_id=str(current_user.id),
-            flow_name=flow.name,
-            context=context,
-        )
-        graph.set_run_id(job_id)
-    except WorkflowValidationError:
-        raise
-    except Exception as e:
-        msg = f"Failed to build graph from flow data: {e!s}"
-        raise WorkflowValidationError(msg) from e
-    return graph
+    if not parsed.input_value:
+        return None
+    return InputValueRequest(
+        components=[],
+        input_value=parsed.input_value,
+        type="chat",
+        session=parsed.session_id,
+    )
 
 
 async def _agui_event_frames(
-    graph: Graph,
     *,
-    flow_id: str,
+    flow_id: UUID,
+    flow_name: str | None,
+    background_tasks: BackgroundTasks,
+    parsed: ParsedWorkflowRun,
+    current_user: UserRead,
     run_id: str,
     thread_id: str,
-    session_id: str | None,
-    inputs: list[InputValueRequest] | None,
 ) -> AsyncIterator[bytes]:
-    """Run the graph, translate its events to AG-UI, yield SSE frames.
+    """Run a flow via the v1 build-vertex loop, translate its events to AG-UI.
 
-    Each frame carries a monotonic ``id:`` so clients can resume via
-    ``Last-Event-ID``. A failure during the run becomes a ``RUN_ERROR`` event
-    rather than an exception. Closing the consumer cancels the graph run.
+    The v1 ``generate_flow_events`` drives the graph vertex-by-vertex, emitting
+    ``vertices_sorted``, ``build_start``, ``end_vertex``, ``token``,
+    ``add_message``, and ``end`` via the EventManager. The translator maps each
+    to AG-UI events; this generator yields them as SSE frames with monotonic
+    ``id:`` for ``Last-Event-ID`` resume. A failure during the run becomes a
+    ``RUN_ERROR`` event rather than an HTTP error; closing the consumer cancels
+    the run.
     """
-    terminal_node_ids = graph.get_terminal_nodes()
     queue: asyncio.Queue = asyncio.Queue()
     event_manager = create_default_event_manager(queue)
     translator = AGUITranslator(run_id=run_id, thread_id=thread_id)
+    input_request = _single_input_value_request(parsed)
 
     async def drive() -> None:
         try:
-            await run_graph_internal(
-                graph=graph,
+            await generate_flow_events(
                 flow_id=flow_id,
-                session_id=session_id,
-                inputs=inputs,
-                outputs=terminal_node_ids,
-                stream=True,
+                background_tasks=background_tasks,
                 event_manager=event_manager,
+                inputs=input_request,
+                data=None,
+                files=None,
+                stop_component_id=parsed.stop_component_id,
+                start_component_id=parsed.start_component_id,
+                log_builds=False,
+                current_user=current_user,
+                flow_name=flow_name,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             event_manager.on_error(data={"error": str(exc)})
-        else:
-            event_manager.on_end(data={})
-        await queue.put((None, None, time.time()))
+            with contextlib.suppress(Exception):
+                await event_manager.queue.put((None, None, time.time()))
+        # generate_flow_events emits on_end and the sentinel on success.
 
     def _frame(ag_event: object, seq: int) -> bytes:
         return format_sse_event(
@@ -538,30 +525,24 @@ def _execute_streaming_workflow(
     flow: FlowRead,
     job_id: UUID,
     current_user: UserRead,
-    http_request: Request,
+    background_tasks: BackgroundTasks,
 ) -> EventSourceResponse:
     """Run a workflow live and stream AG-UI events over server-sent events.
 
-    The graph is built synchronously so build failures surface as HTTP errors;
-    the run itself is driven by an async generator that yields AG-UI SSE frames
-    as the graph emits events. A failure during the run becomes a ``RUN_ERROR``
-    event rather than an HTTP error.
+    The graph is built inside ``generate_flow_events`` (the v1 build-vertex
+    loop) so the same per-vertex events the canvas already knows flow through
+    the translator. A failure during the run becomes a ``RUN_ERROR`` event
+    rather than an HTTP error.
     """
-    graph = _build_run_graph(
-        parsed=parsed,
-        flow=flow,
-        current_user=current_user,
-        http_request=http_request,
-        job_id=job_id,
-    )
     return EventSourceResponse(
         _agui_event_frames(
-            graph,
-            flow_id=str(flow.id),
+            flow_id=flow.id,
+            flow_name=flow.name,
+            background_tasks=background_tasks,
+            parsed=parsed,
+            current_user=current_user,
             run_id=parsed.run_id or str(job_id),
             thread_id=parsed.session_id or str(flow.id),
-            session_id=parsed.session_id,
-            inputs=_build_run_inputs(parsed),
         ),
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -623,20 +604,23 @@ def _register_background_run(job_id: str, bg_run: _BackgroundRun) -> None:
 async def _buffer_background_run(
     *,
     bg_run: _BackgroundRun,
-    graph: Graph,
-    job_id: str,
+    flow: FlowRead,
     parsed: ParsedWorkflowRun,
+    job_id: str,
+    current_user: UserRead,
 ) -> None:
-    """Run a background graph, buffer its AG-UI frames, and finalize job status."""
+    """Run a background flow, buffer its AG-UI frames, and finalize job status."""
+    fresh_background_tasks = BackgroundTasks()
     errored = False
     try:
         async for frame in _agui_event_frames(
-            graph,
-            flow_id=str(graph.flow_id),
+            flow_id=flow.id,
+            flow_name=flow.name,
+            background_tasks=fresh_background_tasks,
+            parsed=parsed,
+            current_user=current_user,
             run_id=parsed.run_id or job_id,
-            thread_id=parsed.session_id or str(graph.flow_id),
-            session_id=parsed.session_id,
-            inputs=_build_run_inputs(parsed),
+            thread_id=parsed.session_id or str(flow.id),
         ):
             if b'"RUN_ERROR"' in frame:
                 errored = True
@@ -655,23 +639,18 @@ async def execute_workflow_background(
     flow: FlowRead,
     job_id: JobId,
     current_user: UserRead,
-    http_request: Request,
+    http_request: Request,  # noqa: ARG001
 ) -> WorkflowJobResponse:
     """Run a workflow in the background, buffering AG-UI events for re-attach.
 
     A job row is created so ``GET /workflows`` and ``POST /workflows/stop`` keep
-    working. The run is fired through the task service with ``graph`` as a
-    kwarg so the task id matches ``job_id`` and ``/stop`` can revoke it.
+    working. The buffer task is scheduled through the queue service under
+    ``job_id`` so ``/stop`` can revoke it. Graph construction happens inside
+    the v1 build-vertex loop driven by ``_agui_event_frames``.
     """
     try:
-        graph = _build_run_graph(
-            parsed=parsed,
-            flow=flow,
-            current_user=current_user,
-            http_request=http_request,
-            job_id=job_id,
-        )
         flow_id_str = str(flow.id)
+        job_id_str = str(job_id)
 
         await get_job_service().create_job(
             job_id=job_id,
@@ -680,20 +659,23 @@ async def execute_workflow_background(
         )
 
         bg_run = _BackgroundRun(user_id=str(current_user.id))
-        _register_background_run(str(job_id), bg_run)
+        _register_background_run(job_id_str, bg_run)
 
-        await get_task_service().fire_and_forget_task(
-            _buffer_background_run,
-            bg_run=bg_run,
-            graph=graph,
-            job_id=str(job_id),
-            parsed=parsed,
+        queue_service = get_queue_service()
+        queue_service.create_queue(job_id_str)
+        queue_service.start_job(
+            job_id_str,
+            _buffer_background_run(
+                bg_run=bg_run,
+                flow=flow,
+                parsed=parsed,
+                job_id=job_id_str,
+                current_user=current_user,
+            ),
         )
-        return WorkflowJobResponse(job_id=str(job_id), flow_id=parsed.flow_id, status=JobStatus.QUEUED)
+        return WorkflowJobResponse(job_id=job_id_str, flow_id=parsed.flow_id, status=JobStatus.QUEUED)
 
     except (WorkflowResourceError, WorkflowServiceUnavailableError, WorkflowQueueFullError):
-        raise
-    except WorkflowValidationError:
         raise
     except MemoryError as exc:
         raise WorkflowResourceError from exc

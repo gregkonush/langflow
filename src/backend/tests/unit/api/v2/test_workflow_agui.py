@@ -300,6 +300,10 @@ class TestAGUIStreaming:
             # text-message events, proving the real event pipeline works.
             assert "TEXT_MESSAGE_START" in body
             assert "TEXT_MESSAGE_CONTENT" in body
+            # Per-vertex events flow through the translator (v1 build-vertex
+            # loop emits end_vertex per node) so the canvas can color nodes.
+            assert "STEP_FINISHED" in body
+            assert "STATE_DELTA" in body
         finally:
             async with session_scope() as session:
                 flow = await session.get(Flow, flow_id)
