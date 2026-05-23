@@ -428,17 +428,20 @@ async def execute_sync_workflow(
 
 
 def _single_input_value_request(parsed: ParsedWorkflowRun) -> InputValueRequest | None:
-    """Build the single chat InputValueRequest the v1 build loop accepts, if any.
+    """Build the single chat InputValueRequest the v1 build loop accepts.
 
     The v1 build path (``generate_flow_events``) takes a single
-    ``InputValueRequest`` rather than a list; an empty chat message means no
-    input is dispatched and parameters arrive via tweaks only.
+    ``InputValueRequest``; when it receives ``None`` it falls back to
+    ``InputValueRequest(session=str(flow_id))``, which would wipe out the
+    caller's session id. We always return one with the parsed session so
+    component messages stay scoped to the user's active session, even when
+    there is no chat input (e.g. the playground "Run Flow" button).
     """
-    if not parsed.input_value:
+    if not parsed.session_id and not parsed.input_value:
         return None
     return InputValueRequest(
         components=[],
-        input_value=parsed.input_value,
+        input_value=parsed.input_value or "",
         type="chat",
         session=parsed.session_id,
     )
