@@ -22,3 +22,11 @@ export const ENABLE_MCP_COMPOSER =
   import.meta.env.LANGFLOW_MCP_COMPOSER_ENABLED === "true";
 export const ENABLE_NEW_SIDEBAR = true;
 export const ENABLE_FETCH_CREDENTIALS = false;
+
+/**
+ * Gate the new AG-UI run path (POST /api/v2/workflows) behind a flag so it
+ * can run parallel to the v1 build path during the migration. Removed in
+ * Phase 5 once the AG-UI path is the only run path.
+ */
+export const ENABLE_V2_WORKFLOWS_AGUI =
+  import.meta.env.LANGFLOW_V2_WORKFLOWS_AGUI_ENABLED === "true";
