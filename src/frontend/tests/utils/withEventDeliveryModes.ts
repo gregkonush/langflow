@@ -5,8 +5,13 @@ type TestFunction = (args: { page: Page }) => Promise<void>;
 type TestConfig = Parameters<typeof test>[1];
 
 /**
- * Wraps a test function to run it with both streaming and polling event delivery modes.
- * Adds a 3-second delay between test runs to ensure proper separation.
+ * Wraps a test function to run it once per v1 ``event_delivery`` mode
+ * (streaming / polling / direct) by intercepting ``/api/v1/config``.
+ *
+ * When the AG-UI flag is on, the v2 workflows endpoint replaces all three v1
+ * delivery modes with a single AG-UI SSE path, so the matrix collapses to a
+ * single run. Phase 5 deletes this wrapper outright once AG-UI is the only
+ * run path.
  *
  * @param title The test title
  * @param config The test configuration (tags, etc)
@@ -17,6 +22,13 @@ export function withEventDeliveryModes(
   config: TestConfig,
   testFn: TestFunction,
 ) {
+  if (process.env.LANGFLOW_V2_WORKFLOWS_AGUI_ENABLED === "true") {
+    test(title, config, async ({ page }) => {
+      await testFn({ page });
+    });
+    return;
+  }
+
   const eventDeliveryModes = ["streaming", "polling", "direct"] as const;
 
   for (const eventDelivery of eventDeliveryModes) {
