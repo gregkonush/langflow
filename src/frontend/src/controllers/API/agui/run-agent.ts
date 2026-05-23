@@ -30,6 +30,8 @@ export interface WorkflowRunOptions {
   startComponentId?: string;
   /** Optional partial-run stop vertex id. */
   stopComponentId?: string;
+  /** Current flow data (nodes + edges) to run; falls back to the DB copy if omitted. */
+  flowData?: { nodes: unknown[]; edges: unknown[] };
 }
 
 /** The v2 workflows endpoint path. */
@@ -63,6 +65,7 @@ export function buildRunInput(opts: WorkflowRunOptions): RunAgentInput {
     forwardedProps.start_component_id = opts.startComponentId;
   if (opts.stopComponentId)
     forwardedProps.stop_component_id = opts.stopComponentId;
+  if (opts.flowData) forwardedProps.data = opts.flowData;
 
   const messages = opts.message
     ? [{ id: uuid(), role: "user" as const, content: opts.message }]

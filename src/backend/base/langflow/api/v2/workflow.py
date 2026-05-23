@@ -52,7 +52,7 @@ from sqlalchemy.exc import OperationalError
 
 from langflow.api.build import generate_flow_events
 from langflow.api.utils import extract_global_variables_from_headers
-from langflow.api.v1.schemas import RunResponse
+from langflow.api.v1.schemas import FlowDataRequest, RunResponse
 from langflow.api.v2.agui_translator import AGUITranslator
 from langflow.api.v2.converters import (
     ParsedWorkflowRun,
@@ -468,6 +468,7 @@ async def _agui_event_frames(
     event_manager = create_default_event_manager(queue)
     translator = AGUITranslator(run_id=run_id, thread_id=thread_id)
     input_request = _single_input_value_request(parsed)
+    flow_data = FlowDataRequest(**parsed.data) if parsed.data else None
 
     async def drive() -> None:
         try:
@@ -476,7 +477,7 @@ async def _agui_event_frames(
                 background_tasks=background_tasks,
                 event_manager=event_manager,
                 inputs=input_request,
-                data=None,
+                data=flow_data,
                 files=None,
                 stop_component_id=parsed.stop_component_id,
                 start_component_id=parsed.start_component_id,

@@ -54,6 +54,9 @@ class ParsedWorkflowRun:
     mode: str = "stream"
     start_component_id: str | None = None
     stop_component_id: str | None = None
+    # Optional live flow data (nodes + edges) overriding the DB copy. Lets the
+    # canvas run with unsaved tweaks the user has made but not yet persisted.
+    data: dict[str, Any] | None = None
 
 
 def parse_run_agent_input(run_input: RunAgentInput) -> ParsedWorkflowRun:
@@ -76,6 +79,7 @@ def parse_run_agent_input(run_input: RunAgentInput) -> ParsedWorkflowRun:
             input_value = getattr(message, "content", "") or ""
             break
 
+    data = forwarded.get("data") if isinstance(forwarded.get("data"), dict) else None
     return ParsedWorkflowRun(
         flow_id=forwarded.get("flow_id"),
         tweaks=forwarded.get("tweaks") or {},
@@ -85,6 +89,7 @@ def parse_run_agent_input(run_input: RunAgentInput) -> ParsedWorkflowRun:
         mode=forwarded.get("mode", "stream"),
         start_component_id=forwarded.get("start_component_id"),
         stop_component_id=forwarded.get("stop_component_id"),
+        data=data,
     )
 
 

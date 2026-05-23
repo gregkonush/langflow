@@ -9,10 +9,11 @@ import {
 import { cloneDeep, zip } from "lodash";
 import { create } from "zustand";
 import { checkCodeValidity } from "@/CustomNodes/helpers/check-code-validity";
-import i18n from "../i18n";
+import { runFlowAGUI } from "@/controllers/API/agui/run-flow-bridge";
 import {
   ENABLE_DATASTAX_LANGFLOW,
   ENABLE_INSPECTION_PANEL,
+  ENABLE_V2_WORKFLOWS_AGUI,
 } from "@/customization/feature-flags";
 import {
   track,
@@ -21,6 +22,7 @@ import {
 } from "@/customization/utils/analytics";
 import { brokenEdgeMessage } from "@/utils/utils";
 import { BuildStatus, EventDeliveryType } from "../constants/enums";
+import i18n from "../i18n";
 import type { LogsLogType, VertexBuildTypeAPI } from "../types/api";
 import type { ChatInputType, ChatOutputType } from "../types/chat";
 import type {
@@ -920,6 +922,22 @@ const useFlowStore = create<FlowStoreType>((set, get) => ({
           ? "Custom components are blocked while custom components are disabled"
           : "Outdated components must be updated",
       );
+    }
+
+    // Phase 4.3: when the AG-UI flag is on, route the run through the v2
+    // workflows endpoint and skip the v1 build path entirely. Current
+    // frontend nodes + edges are sent so unsaved tweaks (dropdowns,
+    // text inputs) run as the user sees them.
+    if (ENABLE_V2_WORKFLOWS_AGUI) {
+      await runFlowAGUI({
+        flowId: currentFlow!.id,
+        message: input_value,
+        threadId: session,
+        startComponentId: startNodeId,
+        stopComponentId: stopNodeId,
+        flowData: { nodes: get().nodes, edges: get().edges },
+      });
+      return;
     }
 
     function validateSubgraph() {}

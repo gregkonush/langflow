@@ -57,6 +57,11 @@ export default defineConfig(({ mode }) => {
       "import.meta.env.LANGFLOW_MCP_COMPOSER_ENABLED": JSON.stringify(
         envLangflow.LANGFLOW_MCP_COMPOSER_ENABLED ?? "true",
       ),
+      "import.meta.env.LANGFLOW_V2_WORKFLOWS_AGUI_ENABLED": JSON.stringify(
+        envLangflow.LANGFLOW_V2_WORKFLOWS_AGUI_ENABLED ??
+          process.env.LANGFLOW_V2_WORKFLOWS_AGUI_ENABLED ??
+          "false",
+      ),
     },
     plugins: [
       react(),
